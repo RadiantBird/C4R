@@ -17,6 +17,8 @@
 
 #include <stdexcept>
 #include <process.h>
+#include <unordered_map>
+
 
 LLVM::LLVM()
     : Module("C4R", Context),
@@ -88,10 +90,144 @@ void LLVM::EmitString(const StringStatement& statement) {
 void LLVM::EmitBody(
     const std::vector<std::unique_ptr<ASTNode>>& body
 ) {
+    std::unordered_map<std::string, llvm::AllocaInst*> variables;
+
+    auto* pointerType = llvm::PointerType::getUnqual(Context);
+
+    llvm::Type* printfArguments[] = {
+        pointerType
+    };
+
+    auto* printfType = llvm::FunctionType::get(
+        Builder.getInt32Ty(),
+        printfArguments,
+        true
+    );
+
+    auto printfFunction = Module.getOrInsertFunction(
+        "printf",
+        printfType
+    );
+
     for (const auto& node : body) {
+
+        // String statement
         if (auto* statement = dynamic_cast<StringStatement*>(node.get())) {
             EmitString(*statement);
         }
+
+        // Variable declaration
+        else if (auto* declaration =
+            dynamic_cast<VariableDeclaration*>(node.get()))
+        {
+            if (declaration->type != "int32") {
+                throw std::runtime_error(
+                    "Unsupported variable type: " + declaration->type
+                );
+            }
+
+            if (variables.contains(declaration->name)) {
+                throw std::runtime_error(
+                    "Duplicate variable: " + declaration->name
+                );
+            }
+
+            auto* literal = dynamic_cast<NumericLiteral*>(
+                declaration->initialValue.get()
+            );
+
+            if (!literal) {
+                throw std::runtime_error(
+                    "Unsupported variable initializer"
+                );
+            }
+
+            auto* type = Builder.getInt32Ty();
+
+            auto* storage = Builder.CreateAlloca(
+                type,
+                nullptr,
+                declaration->name
+            );
+
+            const int value = std::stoi(literal->value);
+
+            Builder.CreateStore(
+                Builder.getInt32(value),
+                storage
+            );
+
+            variables.emplace(
+                declaration->name,
+                storage
+            );
+        }
+
+        // Format string
+        else if (auto* statement =
+            dynamic_cast<FormatStringStatement*>(node.get()))
+        {
+            std::string format;
+            std::vector<llvm::Value*> arguments;
+
+            for (const auto& part : statement->parts) {
+
+                if (auto* text =
+                    dynamic_cast<FormatText*>(part.get()))
+                {
+                    for (char c : text->value) {
+                        if (c == '%') {
+                            format += "%%";
+                        }
+                        else {
+                            format += c;
+                        }
+                    }
+                }
+
+                else if (auto* identifier =
+                    dynamic_cast<IdentifierExpr*>(part.get()))
+                {
+                    auto it = variables.find(identifier->name);
+
+                    if (it == variables.end()) {
+                        throw std::runtime_error(
+                            "Undefined variable: " + identifier->name
+                        );
+                    }
+
+                    format += "%d";
+
+                    arguments.push_back(
+                        Builder.CreateLoad(
+                            Builder.getInt32Ty(),
+                            it->second,
+                            identifier->name + ".value"
+                        )
+                    );
+                }
+
+                else {
+                    throw std::runtime_error(
+                        "Unsupported format string expression"
+                    );
+                }
+            }
+
+            std::vector<llvm::Value*> callArguments;
+
+            callArguments.push_back(CreateString(format));
+
+            for (auto* argument : arguments) {
+                callArguments.push_back(argument);
+            }
+
+            Builder.CreateCall(
+                printfFunction,
+                callArguments
+            );
+        }
+
         else {
             throw std::runtime_error(
                 "Unsupported AST node in function"

@@ -26,7 +26,8 @@ enum class TokenType {
 
     Number,
     Assign,
-    Reserved
+    Reserved,
+    FormatString,
 };
 
 using std::print;
@@ -80,6 +81,8 @@ std::string tokenTypeToString(TokenType type) {
         return "Assign";
     case TokenType::Reserved:
         return "Reserved";
+    case TokenType::FormatString:
+        return "FormatString";
 
     default:
         return "Invalid";
@@ -106,9 +109,14 @@ bool isNumeric(const string& s) {
     return true;
 }
 
+struct Token {
+    TokenType type;
+    string value;
+};
+
 int main() {
     string source = "";
-    string target = "playground/hello.c4r";
+    string target = "playground/var.c4r";
 
     {
         std::ifstream file(target);
@@ -124,15 +132,43 @@ int main() {
         );
     }
 
-    struct Token {
-        TokenType type;
-        string value;
-    };
-
     class Lexer {
     private:
         const std::string& source;
         size_t position = 0;
+
+        Token ParseString(TokenType type) {
+            string value;
+
+            while (position < source.size() && source[position] != '"') {
+                char c = source[position++];
+
+                if (c == '\\' && position < source.size()) {
+                    char escaped = source[position++];
+
+                    switch (escaped) {
+                    case 'n':  value += '\n'; break;
+                    case 't':  value += '\t'; break;
+                    case 'r':  value += '\r'; break;
+                    case '\\': value += '\\'; break;
+                    case '"':  value += '"'; break;
+
+                    default:
+                        throw std::runtime_error("Unknown escape sequence");
+                    }
+                }
+                else {
+                    value += c;
+                }
+            }
+
+            if (position >= source.size()) {
+                throw std::runtime_error("Unterminated string literal");
+            }
+
+            ++position;
+            return { type, value };
+        }
     public:
         Lexer(const std::string& source)
             : source(source) {}
@@ -155,38 +191,8 @@ int main() {
                 case ')':
                     return { TokenType::RightParen, ")" };
 
-                case '"': {
-                    string value;
-
-                    while (position < source.size() && source[position] != '"') {
-                        char c = source[position++];
-
-                        if (c == '\\' && position < source.size()) {
-                            char escaped = source[position++];
-
-                            switch (escaped) {
-                            case 'n':  value += '\n'; break;
-                            case 't':  value += '\t'; break;
-                            case 'r':  value += '\r'; break;
-                            case '\\': value += '\\'; break;
-                            case '"':  value += '"'; break;
-
-                            default:
-                                throw std::runtime_error("Unknown escape sequence");
-                            }
-                        }
-                        else {
-                            value += c;
-                        }
-                    }
-
-                    if (position >= source.size()) {
-                        throw std::runtime_error("Unterminated string literal");
-                    }
-
-                    ++position;
-                    return { TokenType::String, value };
-                }
+                case '"':
+                    return ParseString(TokenType::String);
 
                 case '{':
                     return {TokenType::LeftBrace, "{"};
@@ -198,7 +204,11 @@ int main() {
                     return {TokenType::Assign, "="};
 
                 default:
-                    if (isIdentifier(c)) {
+                    if (c == 'f' && position < source.size() && source[position] == '"') {
+                        ++position; // " を消費
+                        return ParseString(TokenType::FormatString);
+                    }
+                    else if (isIdentifier(c)) {
                         string name(1, c);
 
                         while (
@@ -222,7 +232,10 @@ int main() {
                     }
                     else {
                         string name(1, c);
-                        while (position < source.size() && !isWhitespace(source[position])){
+                        while (
+                            position < source.size() && !isWhitespace(source[position]) &&
+                            source[position] != ';'
+                        ) {
                             name += source[position++];
                         }
 
@@ -247,6 +260,7 @@ int main() {
         void Advance() {
             try {
                 currentToken = lexer.NextToken();
+                print("{}, {}\n", tokenTypeToString(currentToken.type), currentToken.value);
             }
             catch (const std::exception& e) {
                 throw std::runtime_error(std::format("Lexer Error: {}\n", e.what()));
@@ -270,6 +284,72 @@ int main() {
             StringStatement s;
             s.value = v;
             destination.push_back(std::make_unique<StringStatement>(std::move(s)));
+        }
+
+        void ParseFormatStringStatement(vector<unique_ptr<ASTNode>>& destination) {
+            Expect(TokenType::FormatString);
+
+            const string& source = currentToken.value;
+            FormatStringStatement statement;
+
+            size_t position = 0;
+
+            while (position < source.size()) {
+                // 通常テキストを読み取る
+                size_t open = source.find('{', position);
+
+                if (open == string::npos) {
+                    if (position < source.size()) {
+                        auto text = std::make_unique<FormatText>();
+                        text->value = source.substr(position);
+                        statement.parts.push_back(std::move(text));
+                    }
+                    break;
+                }
+
+                // { より前のテキスト
+                if (open > position) {
+                    auto text = std::make_unique<FormatText>();
+                    text->value = source.substr(position, open - position);
+                    statement.parts.push_back(std::move(text));
+                }
+
+                // 対応する } を探す
+                size_t close = source.find('}', open + 1);
+
+                if (close == string::npos) {
+                    throw std::runtime_error("Unclosed format expression");
+                }
+
+                string name = source.substr(open + 1, close - open - 1);
+
+                if (name.empty() || !isIdentifier(name[0])) {
+                    throw std::runtime_error("Expected identifier in format expression");
+                }
+
+                for (size_t i = 1; i < name.size(); ++i) {
+                    if (!isIdentifier(name[i]) &&
+                        !std::isdigit(static_cast<unsigned char>(name[i])))
+                    {
+                        throw std::runtime_error("Invalid identifier in format expression");
+                    }
+                }
+
+                auto identifier = std::make_unique<IdentifierExpr>();
+                identifier->name = std::move(name);
+                statement.parts.push_back(std::move(identifier));
+
+                position = close + 1;
+            }
+
+            Advance();
+
+            Expect(TokenType::EndOfStatement);
+            Advance();
+
+            destination.push_back(
+                std::make_unique<FormatStringStatement>(std::move(statement))
+            );
         }
 
         void ParseFunctionStatement() {
@@ -301,6 +381,9 @@ int main() {
 
                 if (currentToken.type == TokenType::String) {
                     ParseStringStatement(function.body);
+                }
+                else if (currentToken.type == TokenType::FormatString) {
+                    ParseFormatStringStatement(function.body);
                 }
                 else if (currentToken.type == TokenType::TypeName ||
                         (currentToken.type == TokenType::Reserved &&
@@ -389,21 +472,21 @@ int main() {
         }
     };
 
-    Lexer lexer(source);
-    Parser parser(lexer);
-
     try {
+        print("Compiling {}...\n", target);
+
+        print("Parsing program...\n");
         Lexer lexer(source);
         Parser parser(lexer);
 
-        print("Compiling {}...\n", target);
-
         parser.ParseProgram();
 
+        print("Generating IR...\n");
         LLVM llvm;
         llvm.Generate(parser.program);
         llvm.Print();
 
+        print("Generating Binary...\n");
         auto objectPath = std::filesystem::path(target);
         objectPath.replace_extension(".obj");
 

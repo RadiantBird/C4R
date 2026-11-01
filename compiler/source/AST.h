@@ -37,3 +37,15 @@ struct VariableDeclaration : ASTNode {
     bool isConst = false;
     std::unique_ptr<Expression> initialValue;
 };
+
+struct IdentifierExpr : Expression {
+    std::string name;
+};
+
+struct FormatText : ASTNode {
+    std::string value;
+};
+
+struct FormatStringStatement : ASTNode {
+    std::vector<std::unique_ptr<ASTNode>> parts;
+};
