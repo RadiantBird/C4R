@@ -23,8 +23,7 @@ LLVM::LLVM()
       Builder(Context)
 {}
 
-llvm::Type* LLVM::GetType(const std::string& name)
-{
+llvm::Type* LLVM::GetType(const std::string& name) {
     if (name == "void") {
         return Builder.getVoidTy();
     }
@@ -38,8 +37,7 @@ llvm::Type* LLVM::GetType(const std::string& name)
     );
 }
 
-llvm::Value* LLVM::CreateString(const std::string& value)
-{
+llvm::Value* LLVM::CreateString(const std::string& value) {
     auto* global = Builder.CreateGlobalString(
         value,
         "c4r.str",
@@ -60,8 +58,7 @@ llvm::Value* LLVM::CreateString(const std::string& value)
     );
 }
 
-void LLVM::EmitString(const StringStatement& statement)
-{
+void LLVM::EmitString(const StringStatement& statement) {
     auto* pointerType = llvm::PointerType::getUnqual(Context);
 
     llvm::Type* arguments[] = {
@@ -90,8 +87,7 @@ void LLVM::EmitString(const StringStatement& statement)
 
 void LLVM::EmitBody(
     const std::vector<std::unique_ptr<ASTNode>>& body
-)
-{
+) {
     for (const auto& node : body) {
         if (auto* statement = dynamic_cast<StringStatement*>(node.get())) {
             EmitString(*statement);
@@ -104,8 +100,7 @@ void LLVM::EmitBody(
     }
 }
 
-void LLVM::EmitFunction(const FunctionDeclaration& declaration)
-{
+void LLVM::EmitFunction(const FunctionDeclaration& declaration) {
     if (Module.getFunction(declaration.name)) {
         throw std::runtime_error(
             "Duplicate function: " + declaration.name
@@ -149,8 +144,7 @@ void LLVM::EmitFunction(const FunctionDeclaration& declaration)
     }
 }
 
-void LLVM::EmitImplicitMain(const Program& program)
-{
+void LLVM::EmitImplicitMain(const Program& program) {
     auto* functionType = llvm::FunctionType::get(
         Builder.getInt32Ty(),
         false
@@ -180,8 +174,7 @@ void LLVM::EmitImplicitMain(const Program& program)
     Builder.CreateRet(Builder.getInt32(0));
 }
 
-void LLVM::Generate(const Program& program)
-{
+void LLVM::Generate(const Program& program) {
     bool hasMain = false;
     bool hasTopLevelString = false;
 
@@ -228,8 +221,7 @@ void LLVM::Print() {
     Module.print(llvm::outs(), nullptr);
 }
 
-void LLVM::WriteObject(const std::filesystem::path& path)
-{
+void LLVM::WriteObject(const std::filesystem::path& path) {
     static const bool initialized = [] {
         if (llvm::InitializeNativeTarget())
             throw std::runtime_error("Failed to initialize native target");
@@ -339,8 +331,9 @@ void LLVM::LinkExecutable(
             "Failed to start link.exe"
         );
 
-    if (result != 0)
+    if (result != 0) {
         throw std::runtime_error(
             std::format("link.exe failed with exit code {}", result)
         );
+    }
 }

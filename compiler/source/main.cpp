@@ -24,7 +24,9 @@ enum class TokenType {
     RightBrace,
     Blank,
 
-    
+    Number,
+    Assign,
+    Reserved
 };
 
 using std::print;
@@ -33,9 +35,17 @@ using std::unordered_map;
 using std::vector;
 using std::unique_ptr;
 
+// {"", true}, <- for Copy and Paste
+
 unordered_map<string, bool> StandardType = {
     {"int32", true},
     {"void", true},
+};
+
+unordered_map<string, bool> ReservedWord = {
+    {"const", true},
+    {"mutable", true},
+    {"return", true},
 };
 
 std::string tokenTypeToString(TokenType type) {
@@ -63,6 +73,14 @@ std::string tokenTypeToString(TokenType type) {
         return "RightBrace";
     case TokenType::Blank:
         return "Blank";
+
+    case TokenType::Number:
+        return "Number";
+    case TokenType::Assign:
+        return "Assign";
+    case TokenType::Reserved:
+        return "Reserved";
+
     default:
         return "Invalid";
     }
@@ -74,6 +92,18 @@ bool isIdentifier(char c) {
 
 bool isWhitespace(char c) {
     return c == ' ' || c == '\t' || c == '\n';
+}
+
+bool isNumeric(const string& s) {
+    // TODO: support decimal and hex
+    if (s.empty()) return false;
+
+    for (unsigned char c : s) {
+        if (!std::isdigit(c)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 int main() {
@@ -164,6 +194,9 @@ int main() {
                 case '}':
                     return {TokenType::RightBrace, "}"};
 
+                case '=':
+                    return {TokenType::Assign, "="};
+
                 default:
                     if (isIdentifier(c)) {
                         string name(1, c);
@@ -177,7 +210,10 @@ int main() {
                             name += source[position++];
                         }
 
-                        if (StandardType.contains(name)) {
+                        if (ReservedWord.contains(name)) {
+                            return {TokenType::Reserved, name};
+                        }
+                        else if (StandardType.contains(name)) {
                             return {TokenType::TypeName, name};
                         }
                         else {
@@ -189,7 +225,13 @@ int main() {
                         while (position < source.size() && !isWhitespace(source[position])){
                             name += source[position++];
                         }
-                        return { TokenType::Unknown, name };
+
+                        if (isNumeric(name)) {
+                            return { TokenType::Number, name };
+                        }
+                        else {
+                            return { TokenType::Unknown, name };
+                        }
                     }
                 }
             }
@@ -201,7 +243,6 @@ int main() {
     private:
         Lexer& lexer;
         Token currentToken;
-        // FunctionDeclaration currentFunction;
 
         void Advance() {
             try {
@@ -261,6 +302,11 @@ int main() {
                 if (currentToken.type == TokenType::String) {
                     ParseStringStatement(function.body);
                 }
+                else if (currentToken.type == TokenType::TypeName ||
+                        (currentToken.type == TokenType::Reserved &&
+                        currentToken.value == "const")) {
+                    ParseVariableDeclaration(function.body);
+                }
                 else {
                     throw std::runtime_error("Unknown statement in function");
                 }
@@ -270,6 +316,54 @@ int main() {
 
             program.children.push_back(
                 std::make_unique<FunctionDeclaration>(std::move(function))
+            );
+        }
+
+        void ParseVariableDeclaration(vector<unique_ptr<ASTNode>>& destination) {
+            VariableDeclaration variable;
+
+            if (currentToken.type == TokenType::Reserved &&
+                currentToken.value == "const") {
+                variable.isConst = true;
+                Advance();
+            }
+
+            Expect(TokenType::TypeName);
+            variable.type = currentToken.value;
+            Advance();
+
+            if (currentToken.type == TokenType::Reserved &&
+                currentToken.value == "mutable") {
+                if (variable.isConst) {
+                    throw std::runtime_error("const and mutable cannot coexist");
+                }
+
+                variable.isMutable = true;
+                Advance();
+            }
+
+            Expect(TokenType::Identifier);
+            variable.name = currentToken.value;
+            Advance();
+
+            Expect(TokenType::Assign);
+            Advance();
+
+            if (currentToken.type == TokenType::Number) {
+                auto numeric = std::make_unique<NumericLiteral>();
+                numeric->value = currentToken.value;
+                variable.initialValue = std::move(numeric);
+                Advance();
+            }
+            else {
+                throw std::runtime_error("Expected numeric literal");
+            }
+
+            Expect(TokenType::EndOfStatement);
+            Advance();
+
+            destination.push_back(
+                std::make_unique<VariableDeclaration>(std::move(variable))
             );
         }
 

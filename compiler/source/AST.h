@@ -21,3 +21,19 @@ struct FunctionDeclaration : ASTNode {
 struct Program : ASTNode {
     std::vector<std::unique_ptr<ASTNode>> children;
 };
+
+struct Expression : ASTNode {
+    virtual ~Expression() = default;
+};
+
+struct NumericLiteral : Expression {
+    std::string value;
+};
+
+struct VariableDeclaration : ASTNode {
+    std::string name;
+    std::string type;
+    bool isMutable = false;
+    bool isConst = false;
+    std::unique_ptr<Expression> initialValue;
+};
