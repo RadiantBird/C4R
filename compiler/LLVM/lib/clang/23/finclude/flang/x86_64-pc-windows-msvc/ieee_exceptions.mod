@@ -1,0 +1,25 @@
+﻿!mod$ v1 sum:dd6afa5dcdbc9531
+!need$ 36b82225e343593f n __fortran_ieee_exceptions
+module ieee_exceptions
+use __fortran_ieee_exceptions,only:ieee_flag_type
+use __fortran_ieee_exceptions,only:ieee_support_flag
+use __fortran_ieee_exceptions,only:ieee_support_halting
+use __fortran_ieee_exceptions,only:ieee_invalid
+use __fortran_ieee_exceptions,only:ieee_overflow
+use __fortran_ieee_exceptions,only:ieee_divide_by_zero
+use __fortran_ieee_exceptions,only:ieee_underflow
+use __fortran_ieee_exceptions,only:ieee_inexact
+use __fortran_ieee_exceptions,only:ieee_denorm
+use __fortran_ieee_exceptions,only:ieee_usual
+use __fortran_ieee_exceptions,only:ieee_all
+use __fortran_ieee_exceptions,only:ieee_modes_type
+use __fortran_ieee_exceptions,only:ieee_status_type
+use __fortran_ieee_exceptions,only:ieee_get_flag
+use __fortran_ieee_exceptions,only:ieee_get_halting_mode
+use __fortran_ieee_exceptions,only:ieee_get_modes
+use __fortran_ieee_exceptions,only:ieee_get_status
+use __fortran_ieee_exceptions,only:ieee_set_flag
+use __fortran_ieee_exceptions,only:ieee_set_halting_mode
+use __fortran_ieee_exceptions,only:ieee_set_modes
+use __fortran_ieee_exceptions,only:ieee_set_status
+end
