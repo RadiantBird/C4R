@@ -61,9 +61,23 @@ struct ReturnStatement : ASTNode {
     std::unique_ptr<Expression> value;
 };
 
+struct Block : ASTNode { std::vector<std::unique_ptr<ASTNode>> statements; };
 struct IfExpr : Expression {
-
+    std::unique_ptr<Expression> condition;
+    std::unique_ptr<Block> thenBranch, elseBranch;
 };
+struct BlockExpr : Expression { std::unique_ptr<Block> block; };
+struct IfStatement : ASTNode {
+    std::unique_ptr<Expression> condition;
+    std::unique_ptr<Block> thenBranch, elseBranch;
+};
+struct LoopStatement : ASTNode {
+    enum class Kind { While, DoWhile, For } kind;
+    std::unique_ptr<ASTNode> initializer;
+    std::unique_ptr<Expression> condition, step;
+    std::unique_ptr<Block> body;
+};
+struct LoopControl : ASTNode { bool isBreak; };
 
 struct FormatText : ASTNode {
     std::string value;

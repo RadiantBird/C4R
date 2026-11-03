@@ -1,0 +1,20 @@
+int main() {
+    int add = 1 + 2;
+    int sub = 2 - 1;
+    int mul = 3 * 4;
+    int div = 8 / 2;
+
+    f"{add}, {sub}, {mul}, {div}\n";
+
+    bool a = 1 < 2 < 3;
+    bool b = 0 <= 4 <= 2;
+
+    bool and = true && true;
+    bool and2 = false && true;
+
+    bool xor = true ^^ false;
+
+    f"{a}, {b}, {and}, {and2}, {xor}\n";
+
+    return 0;
+}

@@ -154,7 +154,61 @@ llvm::Value* LLVM::EmitBinary(const std::string& op, llvm::Value* left, llvm::Va
     throw std::runtime_error("Unknown operator: " + op);
 }
 
+llvm::Value* LLVM::EmitCondition(const Expression& expression) {
+    auto* value = EmitExpression(expression);
+    if (!value->getType()->isIntegerTy(1)) throw std::runtime_error("Condition must be bool");
+    return value;
+}
+
+void LLVM::EmitVariable(const VariableDeclaration& declaration) {
+    auto* type = GetType(declaration.type);
+    if (type->isVoidTy()) throw std::runtime_error("Variable cannot have void type");
+    auto* value = EmitExpression(*declaration.initialValue);
+    if (value->getType() != type) throw std::runtime_error("Initializer type mismatch: " + declaration.name);
+    auto& entry = Builder.GetInsertBlock()->getParent()->getEntryBlock();
+    llvm::IRBuilder<> entryBuilder(&entry, entry.begin());
+    auto* storage = entryBuilder.CreateAlloca(type, nullptr, declaration.name);
+    Builder.CreateStore(value, storage);
+    variables[declaration.name] = Variable{storage, type, declaration.isMutable};
+}
+
+llvm::Value* LLVM::FinishValueScope(ValueScope& scope) {
+    if (scope.returns.empty()) throw std::runtime_error("Value scope requires return");
+    Builder.SetInsertPoint(scope.exit);
+    auto* result = Builder.CreatePHI(scope.type, static_cast<unsigned>(scope.returns.size()), "scope.value");
+    for (const auto& item : scope.returns) result->addIncoming(item.first, item.second);
+    return result;
+}
+
+llvm::Value* LLVM::EmitValueBlock(const Block& block) {
+    auto* fn = Builder.GetInsertBlock()->getParent();
+    ValueScope scope{llvm::BasicBlock::Create(Context, "value.end", fn), nullptr, {}, loops.size()};
+    valueScopes.push_back(&scope);
+    EmitBody(block.statements);
+    if (!Builder.GetInsertBlock()->hasTerminator()) throw std::runtime_error("Every path in a value scope must return a value");
+    valueScopes.pop_back();
+    return FinishValueScope(scope);
+}
+
 llvm::Value* LLVM::EmitExpression(const Expression& expression) {
+    if (auto* block = dynamic_cast<const BlockExpr*>(&expression)) return EmitValueBlock(*block->block);
+    if (auto* branch = dynamic_cast<const IfExpr*>(&expression)) {
+        auto* condition = EmitCondition(*branch->condition);
+        auto* fn = Builder.GetInsertBlock()->getParent();
+        auto* thenBlock = llvm::BasicBlock::Create(Context, "if.value.then", fn);
+        auto* elseBlock = llvm::BasicBlock::Create(Context, "if.value.else", fn);
+        ValueScope scope{llvm::BasicBlock::Create(Context, "if.value.end", fn), nullptr, {}, loops.size()};
+        Builder.CreateCondBr(condition, thenBlock, elseBlock);
+        valueScopes.push_back(&scope);
+        Builder.SetInsertPoint(thenBlock);
+        EmitBody(branch->thenBranch->statements);
+        if (!Builder.GetInsertBlock()->hasTerminator()) throw std::runtime_error("Every if expression branch must return a value");
+        Builder.SetInsertPoint(elseBlock);
+        EmitBody(branch->elseBranch->statements);
+        if (!Builder.GetInsertBlock()->hasTerminator()) throw std::runtime_error("Every if expression branch must return a value");
+        valueScopes.pop_back();
+        return FinishValueScope(scope);
+    }
     if (auto* literal = dynamic_cast<const NumericLiteral*>(&expression)) {
         auto value = std::stoll(literal->value);
         if (value > INT32_MAX) throw std::runtime_error("Integer literal out of range");
@@ -247,7 +301,8 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
 void LLVM::EmitBody(
     const std::vector<std::unique_ptr<ASTNode>>& body
 ) {
-    variables.clear();
+    auto outerVariables = variables;
+    std::unordered_set<std::string> localNames;
 
     auto* pointerType = llvm::PointerType::getUnqual(Context);
 
@@ -273,6 +328,16 @@ void LLVM::EmitBody(
             throw std::runtime_error("Unreachable statement after return");
         }
         if (auto* statement = dynamic_cast<ReturnStatement*>(node.get())) {
+            if (!valueScopes.empty()) {
+                if (!statement->value) throw std::runtime_error("Value scope requires a return value");
+                auto* value = EmitExpression(*statement->value);
+                auto& scope = *valueScopes.back();
+                if (scope.type && scope.type != value->getType()) throw std::runtime_error("Value scope return types do not match");
+                scope.type = value->getType();
+                scope.returns.emplace_back(value, Builder.GetInsertBlock());
+                Builder.CreateBr(scope.exit);
+                continue;
+            }
             auto* resultType = Builder.GetInsertBlock()->getParent()->getReturnType();
             if (!statement->value) {
                 if (!resultType->isVoidTy()) throw std::runtime_error("Return value required");
@@ -283,6 +348,57 @@ void LLVM::EmitBody(
                 Builder.CreateRet(value);
             }
         }
+        else if (auto* block = dynamic_cast<Block*>(node.get())) {
+            EmitBody(block->statements);
+        }
+        else if (auto* branch = dynamic_cast<IfStatement*>(node.get())) {
+            auto* condition = EmitCondition(*branch->condition);
+            auto* fn = Builder.GetInsertBlock()->getParent();
+            auto* thenBlock = llvm::BasicBlock::Create(Context, "if.then", fn);
+            auto* elseBlock = llvm::BasicBlock::Create(Context, "if.else", fn);
+            auto* done = llvm::BasicBlock::Create(Context, "if.end", fn);
+            Builder.CreateCondBr(condition, thenBlock, elseBlock);
+            Builder.SetInsertPoint(thenBlock);
+            EmitBody(branch->thenBranch->statements);
+            bool thenTerminated = Builder.GetInsertBlock()->hasTerminator();
+            if (!thenTerminated) Builder.CreateBr(done);
+            Builder.SetInsertPoint(elseBlock);
+            if (branch->elseBranch) EmitBody(branch->elseBranch->statements);
+            bool elseTerminated = Builder.GetInsertBlock()->hasTerminator();
+            if (!elseTerminated) Builder.CreateBr(done);
+            Builder.SetInsertPoint(done);
+            if (thenTerminated && elseTerminated) Builder.CreateUnreachable();
+        }
+        else if (auto* loop = dynamic_cast<LoopStatement*>(node.get())) {
+            auto savedVariables = variables;
+            if (auto* declaration = dynamic_cast<VariableDeclaration*>(loop->initializer.get())) EmitVariable(*declaration);
+            else if (auto* initializer = dynamic_cast<Expression*>(loop->initializer.get())) EmitExpression(*initializer);
+            auto* fn = Builder.GetInsertBlock()->getParent();
+            auto* conditionBlock = llvm::BasicBlock::Create(Context, "loop.condition", fn);
+            auto* bodyBlock = llvm::BasicBlock::Create(Context, "loop.body", fn);
+            auto* stepBlock = llvm::BasicBlock::Create(Context, "loop.step", fn);
+            auto* done = llvm::BasicBlock::Create(Context, "loop.end", fn);
+            Builder.CreateBr(loop->kind == LoopStatement::Kind::DoWhile ? bodyBlock : conditionBlock);
+            Builder.SetInsertPoint(conditionBlock);
+            auto* condition = loop->condition ? EmitCondition(*loop->condition) : Builder.getTrue();
+            Builder.CreateCondBr(condition, bodyBlock, done);
+            Builder.SetInsertPoint(bodyBlock);
+            loops.emplace_back(done, stepBlock);
+            EmitBody(loop->body->statements);
+            loops.pop_back();
+            if (!Builder.GetInsertBlock()->hasTerminator()) Builder.CreateBr(stepBlock);
+            Builder.SetInsertPoint(stepBlock);
+            if (loop->step) EmitExpression(*loop->step);
+            Builder.CreateBr(conditionBlock);
+            Builder.SetInsertPoint(done);
+            variables = std::move(savedVariables);
+        }
+        else if (auto* control = dynamic_cast<LoopControl*>(node.get())) {
+            if (loops.empty()) throw std::runtime_error("break or continue outside loop");
+            if (!valueScopes.empty() && loops.size() <= valueScopes.back()->loopDepth)
+                throw std::runtime_error("Cannot leave a value scope with break or continue");
+            Builder.CreateBr(control->isBreak ? loops.back().first : loops.back().second);
+        }
         // String statement
         else if (auto* statement = dynamic_cast<StringStatement*>(node.get())) {
             EmitString(*statement);
@@ -292,29 +408,13 @@ void LLVM::EmitBody(
         else if (auto* declaration =
             dynamic_cast<VariableDeclaration*>(node.get()))
         {
-            if (variables.contains(declaration->name)) {
+            if (!localNames.insert(declaration->name).second) {
                 throw std::runtime_error(
                     "Duplicate variable: " + declaration->name
                 );
             }
 
-            auto* type = GetType(declaration->type);
-            if (type->isVoidTy()) throw std::runtime_error("Variable cannot have void type");
-            auto* value = EmitExpression(*declaration->initialValue);
-            if (value->getType() != type) throw std::runtime_error("Initializer type mismatch: " + declaration->name);
-
-            auto* storage = Builder.CreateAlloca(
-                type,
-                nullptr,
-                declaration->name
-            );
-
-            Builder.CreateStore(value, storage);
-
-            variables.emplace(
-                declaration->name,
-                Variable{storage, type, declaration->isMutable}
-            );
+            EmitVariable(*declaration);
         }
 
         else if (auto* expression = dynamic_cast<Expression*>(node.get())) {
@@ -388,6 +488,7 @@ void LLVM::EmitBody(
             );
         }
     }
+    variables = std::move(outerVariables);
 }
 
 void LLVM::EmitFunction(const FunctionDeclaration& declaration) {
@@ -419,6 +520,7 @@ void LLVM::EmitFunction(const FunctionDeclaration& declaration) {
 
     Builder.SetInsertPoint(entry);
 
+    variables.clear();
     EmitBody(declaration.body);
 
     if (Builder.GetInsertBlock()->hasTerminator()) {
@@ -458,9 +560,10 @@ void LLVM::EmitImplicitMain(const Program& program) {
 
     Builder.SetInsertPoint(entry);
 
+    variables.clear();
     EmitBody(program.children);
 
-    Builder.CreateRet(Builder.getInt32(0));
+    if (!Builder.GetInsertBlock()->hasTerminator()) Builder.CreateRet(Builder.getInt32(0));
 }
 
 void LLVM::Generate(const Program& program) {
@@ -473,7 +576,7 @@ void LLVM::Generate(const Program& program) {
                 hasMain = true;
             }
         }
-        else if (dynamic_cast<StringStatement*>(node.get()) || dynamic_cast<FormatStringStatement*>(node.get()) || dynamic_cast<VariableDeclaration*>(node.get()) || dynamic_cast<Expression*>(node.get())) {
+        else if (!dynamic_cast<FunctionDeclaration*>(node.get())) {
             hasTopLevelString = true;
         }
         else {

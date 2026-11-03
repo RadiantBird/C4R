@@ -1,0 +1,17 @@
+int32 main() {
+    int32 mutable i = 0;
+    while (i < 5) {
+        f"{i}\n";
+        i++;
+    }
+
+    int32 apple = 7;
+    if (5 < apple < 10) {
+        "yay\n";
+    }
+    else {
+        "nah\n";
+    }
+
+    return 0;
+}

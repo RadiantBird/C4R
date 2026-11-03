@@ -51,11 +51,14 @@ unordered_map<string, bool> StandardType = {
 
 unordered_map<string, bool> ReservedWord = {
     {"if", true},
+    {"else", true},
     {"for", true},
     {"while", true},
     {"do", true},
     {"return", true},
     {"capture", true},
+    {"break", true},
+    {"continue", true},
 
     {"const", true},
     {"mutable", true},    
@@ -345,6 +348,24 @@ int main(int argc, char** argv) {
                 Advance();
                 unary->operand = ParseExpression(16);
                 left = std::move(unary);
+            } else if (currentToken.value == "if") {
+                auto value = std::make_unique<IfExpr>();
+                Advance();
+                Expect(TokenType::LeftParen); Advance();
+                value->condition = ParseExpression();
+                Expect(TokenType::RightParen); Advance();
+                value->thenBranch = ParseBlock();
+                if (currentToken.value != "else") throw std::runtime_error("if expression requires else");
+                Advance();
+                if (currentToken.value == "if") {
+                    value->elseBranch = std::make_unique<Block>();
+                    ParseStatement(value->elseBranch->statements);
+                } else value->elseBranch = ParseBlock();
+                left = std::move(value);
+            } else if (currentToken.type == TokenType::LeftBrace) {
+                auto value = std::make_unique<BlockExpr>();
+                value->block = ParseBlock();
+                left = std::move(value);
             } else if (currentToken.type == TokenType::LeftParen) {
                 Advance();
                 left = ParseExpression();
@@ -484,6 +505,89 @@ int main(int argc, char** argv) {
             );
         }
 
+        std::unique_ptr<Block> ParseBlock() {
+            Expect(TokenType::LeftBrace); Advance();
+            auto block = std::make_unique<Block>();
+            while (currentToken.type != TokenType::RightBrace) {
+                if (currentToken.type == TokenType::EndOfFile) throw std::runtime_error("Unexpected EOF in block");
+                ParseStatement(block->statements);
+            }
+            Advance();
+            return block;
+        }
+
+        void ParseStatement(vector<unique_ptr<ASTNode>>& destination) {
+            if (currentToken.type == TokenType::String) { ParseStringStatement(destination); return; }
+            if (currentToken.type == TokenType::FormatString) { ParseFormatStringStatement(destination); return; }
+            if (currentToken.type == TokenType::TypeName || currentToken.value == "const") { ParseVariableDeclaration(destination); return; }
+            if (currentToken.type == TokenType::LeftBrace) { destination.push_back(ParseBlock()); return; }
+            if (currentToken.value == "return") {
+                Advance();
+                auto statement = std::make_unique<ReturnStatement>();
+                if (currentToken.type != TokenType::EndOfStatement) statement->value = ParseExpression();
+                Expect(TokenType::EndOfStatement); Advance();
+                destination.push_back(std::move(statement)); return;
+            }
+            if (currentToken.value == "break" || currentToken.value == "continue") {
+                auto control = std::make_unique<LoopControl>();
+                control->isBreak = currentToken.value == "break";
+                Advance(); Expect(TokenType::EndOfStatement); Advance();
+                destination.push_back(std::move(control)); return;
+            }
+            if (currentToken.value == "if") {
+                auto statement = std::make_unique<IfStatement>();
+                Advance(); Expect(TokenType::LeftParen); Advance();
+                statement->condition = ParseExpression();
+                Expect(TokenType::RightParen); Advance();
+                statement->thenBranch = ParseBlock();
+                if (currentToken.value == "else") {
+                    Advance();
+                    if (currentToken.value == "if") {
+                        statement->elseBranch = std::make_unique<Block>();
+                        ParseStatement(statement->elseBranch->statements);
+                    } else statement->elseBranch = ParseBlock();
+                }
+                destination.push_back(std::move(statement)); return;
+            }
+            if (currentToken.value == "while" || currentToken.value == "for" || currentToken.value == "do") {
+                auto loop = std::make_unique<LoopStatement>();
+                const string kind = currentToken.value;
+                loop->kind = kind == "for" ? LoopStatement::Kind::For : kind == "do" ? LoopStatement::Kind::DoWhile : LoopStatement::Kind::While;
+                Advance();
+                if (kind != "do") {
+                    Expect(TokenType::LeftParen); Advance();
+                    if (kind == "for") {
+                        if (currentToken.type == TokenType::TypeName || currentToken.value == "const") {
+                            vector<unique_ptr<ASTNode>> init;
+                            ParseVariableDeclaration(init);
+                            loop->initializer = std::move(init.front());
+                        } else {
+                            if (currentToken.type != TokenType::EndOfStatement) loop->initializer = ParseExpression();
+                            Expect(TokenType::EndOfStatement); Advance();
+                        }
+                    }
+                    if (kind != "for" || currentToken.type != TokenType::EndOfStatement) loop->condition = ParseExpression();
+                    if (kind == "for") {
+                        Expect(TokenType::EndOfStatement); Advance();
+                        if (currentToken.type != TokenType::RightParen) loop->step = ParseExpression();
+                    }
+                    Expect(TokenType::RightParen); Advance();
+                }
+                loop->body = ParseBlock();
+                if (kind == "do") {
+                    if (currentToken.value != "while") throw std::runtime_error("Expected while after do block");
+                    Advance(); Expect(TokenType::LeftParen); Advance();
+                    loop->condition = ParseExpression();
+                    Expect(TokenType::RightParen); Advance();
+                    Expect(TokenType::EndOfStatement); Advance();
+                }
+                destination.push_back(std::move(loop)); return;
+            }
+            auto expression = ParseExpression();
+            Expect(TokenType::EndOfStatement); Advance();
+            destination.push_back(std::move(expression));
+        }
+
         void ParseFunctionStatement() {
             Expect(TokenType::TypeName);
             string typev = currentToken.value;
@@ -499,46 +603,11 @@ int main(int argc, char** argv) {
             Expect(TokenType::RightParen);
             Advance();
 
-            Expect(TokenType::LeftBrace);
-            Advance();
-
             FunctionDeclaration function;
             function.name = ident;
             function.returnType = typev;
 
-            while (currentToken.type != TokenType::RightBrace) {
-                if (currentToken.type == TokenType::EndOfFile) {
-                    throw std::runtime_error("Unexpected EOF in function");
-                }
-
-                if (currentToken.type == TokenType::String) {
-                    ParseStringStatement(function.body);
-                }
-                else if (currentToken.type == TokenType::FormatString) {
-                    ParseFormatStringStatement(function.body);
-                }
-                else if (currentToken.type == TokenType::TypeName ||
-                        (currentToken.type == TokenType::Reserved &&
-                        currentToken.value == "const")) {
-                    ParseVariableDeclaration(function.body);
-                }
-                else if (currentToken.value == "return") {
-                    Advance();
-                    auto statement = std::make_unique<ReturnStatement>();
-                    if (currentToken.type != TokenType::EndOfStatement) statement->value = ParseExpression();
-                    Expect(TokenType::EndOfStatement);
-                    Advance();
-                    function.body.push_back(std::move(statement));
-                }
-                else {
-                    auto expression = ParseExpression();
-                    Expect(TokenType::EndOfStatement);
-                    Advance();
-                    function.body.push_back(std::move(expression));
-                }
-            }
-
-            Advance();
+            function.body = std::move(ParseBlock()->statements);
 
             program.children.push_back(
                 std::make_unique<FunctionDeclaration>(std::move(function))
@@ -585,13 +654,6 @@ int main(int argc, char** argv) {
             );
         }
 
-        void ParseControlStructure() {
-            Expect(TokenType::Reserved);
-            Advance();
-
-            Expect(TokenType::LeftParen);
-        }
-
     public:
         Program program;
         Parser(Lexer& lexer)
@@ -618,14 +680,8 @@ int main(int argc, char** argv) {
                 else if (currentToken.type == TokenType::FormatString) {
                     ParseFormatStringStatement(program.children);
                 }
-                else if (currentToken.type == TokenType::Reserved) {
-                    throw std::runtime_error("Unsupported top-level statement: " + currentToken.value);
-                }
                 else {
-                    auto expression = ParseExpression();
-                    Expect(TokenType::EndOfStatement);
-                    Advance();
-                    program.children.push_back(std::move(expression));
+                    ParseStatement(program.children);
                 }
             }
         }
