@@ -1,6 +1,7 @@
 #include "LLVM.h"
 
 #include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Intrinsics.h>
 #include <llvm/Support/raw_ostream.h>
 
 #include <llvm/Support/TargetSelect.h>
@@ -30,9 +31,10 @@ llvm::Type* LLVM::GetType(const std::string& name) {
         return Builder.getVoidTy();
     }
 
-    if (name == "int32") {
+    if (name == "int32" || name == "int") {
         return Builder.getInt32Ty();
     }
+    if (name == "bool") return Builder.getInt1Ty();
 
     throw std::runtime_error(
         "Unknown type: " + name
@@ -87,10 +89,165 @@ void LLVM::EmitString(const StringStatement& statement) {
     );
 }
 
+LLVM::Variable& LLVM::MutableVariable(const Expression& expression) {
+    auto* identifier = dynamic_cast<const IdentifierExpr*>(&expression);
+    if (!identifier) throw std::runtime_error("Assignment requires a variable");
+    auto it = variables.find(identifier->name);
+    if (it == variables.end()) throw std::runtime_error("Undefined variable: " + identifier->name);
+    if (!it->second.isMutable) throw std::runtime_error("Cannot modify immutable variable: " + identifier->name);
+    return it->second;
+}
+
+llvm::Value* LLVM::EmitBinary(const std::string& op, llvm::Value* left, llvm::Value* right) {
+    if (left->getType() != right->getType()) throw std::runtime_error("Operand types do not match for " + op);
+    if (op == "==") return Builder.CreateICmpEQ(left, right);
+    if (op == "!=") return Builder.CreateICmpNE(left, right);
+    if (op == "^^") {
+        if (!left->getType()->isIntegerTy(1)) throw std::runtime_error("Logical operator requires bool operands");
+        return Builder.CreateXor(left, right);
+    }
+    if (!left->getType()->isIntegerTy(32)) throw std::runtime_error("Operator requires int32 operands: " + op);
+    if (op == "+") return Builder.CreateAdd(left, right);
+    if (op == "-") return Builder.CreateSub(left, right);
+    if (op == "*") return Builder.CreateMul(left, right);
+    if (op == "/") return Builder.CreateSDiv(left, right);
+    if (op == "%") return Builder.CreateSRem(left, right);
+    if (op == "&") return Builder.CreateAnd(left, right);
+    if (op == "|") return Builder.CreateOr(left, right);
+    if (op == "^") return Builder.CreateXor(left, right);
+    if (op == "<<") return Builder.CreateShl(left, right);
+    if (op == ">>") return Builder.CreateAShr(left, right);
+    if (op == "<") return Builder.CreateICmpSLT(left, right);
+    if (op == "<=") return Builder.CreateICmpSLE(left, right);
+    if (op == ">") return Builder.CreateICmpSGT(left, right);
+    if (op == ">=") return Builder.CreateICmpSGE(left, right);
+    if (op == "`") {
+        if (auto* exponent = llvm::dyn_cast<llvm::ConstantInt>(right); exponent && exponent->isNegative())
+            throw std::runtime_error("Integer exponent must be nonnegative");
+        auto* fn = Builder.GetInsertBlock()->getParent();
+        auto* valid = llvm::BasicBlock::Create(Context, "pow.valid", fn);
+        auto* invalid = llvm::BasicBlock::Create(Context, "pow.invalid", fn);
+        auto* loop = llvm::BasicBlock::Create(Context, "pow.loop", fn);
+        auto* body = llvm::BasicBlock::Create(Context, "pow.body", fn);
+        auto* done = llvm::BasicBlock::Create(Context, "pow.done", fn);
+        Builder.CreateCondBr(Builder.CreateICmpSGE(right, Builder.getInt32(0)), valid, invalid);
+        Builder.SetInsertPoint(invalid);
+        Builder.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(&Module, llvm::Intrinsic::trap));
+        Builder.CreateUnreachable();
+        Builder.SetInsertPoint(valid);
+        Builder.CreateBr(loop);
+        Builder.SetInsertPoint(loop);
+        auto* count = Builder.CreatePHI(Builder.getInt32Ty(), 2);
+        auto* result = Builder.CreatePHI(Builder.getInt32Ty(), 2);
+        count->addIncoming(right, valid);
+        result->addIncoming(Builder.getInt32(1), valid);
+        Builder.CreateCondBr(Builder.CreateICmpSGT(count, Builder.getInt32(0)), body, done);
+        Builder.SetInsertPoint(body);
+        auto* nextResult = Builder.CreateMul(result, left);
+        auto* nextCount = Builder.CreateSub(count, Builder.getInt32(1));
+        Builder.CreateBr(loop);
+        count->addIncoming(nextCount, body);
+        result->addIncoming(nextResult, body);
+        Builder.SetInsertPoint(done);
+        return result;
+    }
+    throw std::runtime_error("Unknown operator: " + op);
+}
+
+llvm::Value* LLVM::EmitExpression(const Expression& expression) {
+    if (auto* literal = dynamic_cast<const NumericLiteral*>(&expression)) {
+        auto value = std::stoll(literal->value);
+        if (value > INT32_MAX) throw std::runtime_error("Integer literal out of range");
+        return Builder.getInt32(static_cast<int32_t>(value));
+    }
+    if (auto* literal = dynamic_cast<const BooleanLiteral*>(&expression)) return Builder.getInt1(literal->value);
+    if (auto* identifier = dynamic_cast<const IdentifierExpr*>(&expression)) {
+        auto it = variables.find(identifier->name);
+        if (it == variables.end()) throw std::runtime_error("Undefined variable: " + identifier->name);
+        return Builder.CreateLoad(it->second.type, it->second.storage, identifier->name + ".value");
+    }
+    if (auto* unary = dynamic_cast<const UnaryExpr*>(&expression)) {
+        if (unary->op == "++" || unary->op == "--") {
+            auto& var = MutableVariable(*unary->operand);
+            if (!var.type->isIntegerTy(32)) throw std::runtime_error("Increment requires int32");
+            auto* old = Builder.CreateLoad(var.type, var.storage);
+            auto* value = unary->op == "++" ? Builder.CreateAdd(old, Builder.getInt32(1)) : Builder.CreateSub(old, Builder.getInt32(1));
+            Builder.CreateStore(value, var.storage);
+            return unary->postfix ? old : value;
+        }
+        auto* value = EmitExpression(*unary->operand);
+        if (unary->op == "!") {
+            if (!value->getType()->isIntegerTy(1)) throw std::runtime_error("Logical NOT requires bool");
+            return Builder.CreateNot(value);
+        }
+        if (!value->getType()->isIntegerTy(32)) throw std::runtime_error("Unary operator requires int32");
+        if (unary->op == "+") return value;
+        if (unary->op == "-") return Builder.CreateNeg(value);
+        if (unary->op == "~") return Builder.CreateNot(value);
+    }
+    if (auto* chain = dynamic_cast<const ComparisonExpr*>(&expression)) {
+        auto* fn = Builder.GetInsertBlock()->getParent();
+        auto* done = llvm::BasicBlock::Create(Context, "compare.end", fn);
+        std::vector<llvm::BasicBlock*> failures;
+        auto* left = EmitExpression(*chain->operands[0]);
+        for (size_t i = 0; i < chain->operators.size(); ++i) {
+            auto* right = EmitExpression(*chain->operands[i + 1]);
+            auto* comparison = EmitBinary(chain->operators[i], left, right);
+            auto* next = llvm::BasicBlock::Create(Context, "compare.next", fn);
+            failures.push_back(Builder.GetInsertBlock());
+            Builder.CreateCondBr(comparison, next, done);
+            Builder.SetInsertPoint(next);
+            left = right;
+        }
+        auto* success = Builder.GetInsertBlock();
+        Builder.CreateBr(done);
+        Builder.SetInsertPoint(done);
+        auto* result = Builder.CreatePHI(Builder.getInt1Ty(), static_cast<unsigned>(failures.size() + 1));
+        for (auto* block : failures) result->addIncoming(Builder.getFalse(), block);
+        result->addIncoming(Builder.getTrue(), success);
+        return result;
+    }
+    if (auto* binary = dynamic_cast<const BinaryExpr*>(&expression)) {
+        const auto& op = binary->op;
+        if (op == "=" || op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" || op == "&=" || op == "|=" || op == "^=" || op == "<<=" || op == ">>=") {
+            auto& var = MutableVariable(*binary->left);
+            auto* old = op == "=" ? nullptr : Builder.CreateLoad(var.type, var.storage);
+            auto* value = EmitExpression(*binary->right);
+            if (value->getType() != var.type) throw std::runtime_error("Assignment type mismatch");
+            if (old) value = EmitBinary(op.substr(0, op.size() - 1), old, value);
+            Builder.CreateStore(value, var.storage);
+            return value;
+        }
+        auto* left = EmitExpression(*binary->left);
+        if (op == "&&" || op == "||" || op == "!&&" || op == "!||") {
+            if (!left->getType()->isIntegerTy(1)) throw std::runtime_error("Logical operator requires bool operands");
+            const bool isAnd = op == "&&" || op == "!&&";
+            const bool negate = op == "!&&" || op == "!||";
+            auto* fn = Builder.GetInsertBlock()->getParent();
+            auto* start = Builder.GetInsertBlock();
+            auto* rhs = llvm::BasicBlock::Create(Context, "logic.rhs", fn);
+            auto* done = llvm::BasicBlock::Create(Context, "logic.end", fn);
+            Builder.CreateCondBr(left, isAnd ? rhs : done, isAnd ? done : rhs);
+            Builder.SetInsertPoint(rhs);
+            auto* right = EmitExpression(*binary->right);
+            if (!right->getType()->isIntegerTy(1)) throw std::runtime_error("Logical operator requires bool operands");
+            auto* endRhs = Builder.GetInsertBlock();
+            Builder.CreateBr(done);
+            Builder.SetInsertPoint(done);
+            auto* result = Builder.CreatePHI(Builder.getInt1Ty(), 2);
+            result->addIncoming(Builder.getInt1(!isAnd), start);
+            result->addIncoming(right, endRhs);
+            return negate ? Builder.CreateNot(result) : result;
+        }
+        return EmitBinary(op, left, EmitExpression(*binary->right));
+    }
+    throw std::runtime_error("Unsupported expression");
+}
+
 void LLVM::EmitBody(
     const std::vector<std::unique_ptr<ASTNode>>& body
 ) {
-    std::unordered_map<std::string, llvm::AllocaInst*> variables;
+    variables.clear();
 
     auto* pointerType = llvm::PointerType::getUnqual(Context);
 
@@ -111,8 +268,23 @@ void LLVM::EmitBody(
 
     for (const auto& node : body) {
 
+        if (dynamic_cast<FunctionDeclaration*>(node.get())) continue;
+        if (Builder.GetInsertBlock()->hasTerminator()) {
+            throw std::runtime_error("Unreachable statement after return");
+        }
+        if (auto* statement = dynamic_cast<ReturnStatement*>(node.get())) {
+            auto* resultType = Builder.GetInsertBlock()->getParent()->getReturnType();
+            if (!statement->value) {
+                if (!resultType->isVoidTy()) throw std::runtime_error("Return value required");
+                Builder.CreateRetVoid();
+            } else {
+                auto* value = EmitExpression(*statement->value);
+                if (value->getType() != resultType) throw std::runtime_error("Invalid return value type");
+                Builder.CreateRet(value);
+            }
+        }
         // String statement
-        if (auto* statement = dynamic_cast<StringStatement*>(node.get())) {
+        else if (auto* statement = dynamic_cast<StringStatement*>(node.get())) {
             EmitString(*statement);
         }
 
@@ -120,29 +292,16 @@ void LLVM::EmitBody(
         else if (auto* declaration =
             dynamic_cast<VariableDeclaration*>(node.get()))
         {
-            if (declaration->type != "int32") {
-                throw std::runtime_error(
-                    "Unsupported variable type: " + declaration->type
-                );
-            }
-
             if (variables.contains(declaration->name)) {
                 throw std::runtime_error(
                     "Duplicate variable: " + declaration->name
                 );
             }
 
-            auto* literal = dynamic_cast<NumericLiteral*>(
-                declaration->initialValue.get()
-            );
-
-            if (!literal) {
-                throw std::runtime_error(
-                    "Unsupported variable initializer"
-                );
-            }
-
-            auto* type = Builder.getInt32Ty();
+            auto* type = GetType(declaration->type);
+            if (type->isVoidTy()) throw std::runtime_error("Variable cannot have void type");
+            auto* value = EmitExpression(*declaration->initialValue);
+            if (value->getType() != type) throw std::runtime_error("Initializer type mismatch: " + declaration->name);
 
             auto* storage = Builder.CreateAlloca(
                 type,
@@ -150,17 +309,16 @@ void LLVM::EmitBody(
                 declaration->name
             );
 
-            const int value = std::stoi(literal->value);
-
-            Builder.CreateStore(
-                Builder.getInt32(value),
-                storage
-            );
+            Builder.CreateStore(value, storage);
 
             variables.emplace(
                 declaration->name,
-                storage
+                Variable{storage, type, declaration->isMutable}
             );
+        }
+
+        else if (auto* expression = dynamic_cast<Expression*>(node.get())) {
+            EmitExpression(*expression);
         }
 
         // Format string
@@ -198,13 +356,9 @@ void LLVM::EmitBody(
 
                     format += "%d";
 
-                    arguments.push_back(
-                        Builder.CreateLoad(
-                            Builder.getInt32Ty(),
-                            it->second,
-                            identifier->name + ".value"
-                        )
-                    );
+                    llvm::Value* value = Builder.CreateLoad(it->second.type, it->second.storage, identifier->name + ".value");
+                    if (it->second.type->isIntegerTy(1)) value = Builder.CreateZExt(value, Builder.getInt32Ty());
+                    arguments.push_back(value);
                 }
 
                 else {
@@ -267,6 +421,9 @@ void LLVM::EmitFunction(const FunctionDeclaration& declaration) {
 
     EmitBody(declaration.body);
 
+    if (Builder.GetInsertBlock()->hasTerminator()) {
+        return;
+    }
     if (returnType->isVoidTy()) {
         Builder.CreateRetVoid();
     }
@@ -301,11 +458,7 @@ void LLVM::EmitImplicitMain(const Program& program) {
 
     Builder.SetInsertPoint(entry);
 
-    for (const auto& node : program.children) {
-        if (auto* statement = dynamic_cast<StringStatement*>(node.get())) {
-            EmitString(*statement);
-        }
-    }
+    EmitBody(program.children);
 
     Builder.CreateRet(Builder.getInt32(0));
 }
@@ -320,7 +473,7 @@ void LLVM::Generate(const Program& program) {
                 hasMain = true;
             }
         }
-        else if (dynamic_cast<StringStatement*>(node.get())) {
+        else if (dynamic_cast<StringStatement*>(node.get()) || dynamic_cast<FormatStringStatement*>(node.get()) || dynamic_cast<VariableDeclaration*>(node.get()) || dynamic_cast<Expression*>(node.get())) {
             hasTopLevelString = true;
         }
         else {

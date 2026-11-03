@@ -2,6 +2,7 @@
 
 #include "AST.h"
 #include <filesystem>
+#include <unordered_map>
 
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -26,6 +27,12 @@ private:
     llvm::LLVMContext Context;
     llvm::Module Module;
     llvm::IRBuilder<> Builder;
+    struct Variable { llvm::AllocaInst* storage; llvm::Type* type; bool isMutable; };
+    std::unordered_map<std::string, Variable> variables;
+
+    llvm::Value* EmitExpression(const Expression& expression);
+    llvm::Value* EmitBinary(const std::string& op, llvm::Value* left, llvm::Value* right);
+    Variable& MutableVariable(const Expression& expression);
 
     llvm::Type* GetType(const std::string& name);
 

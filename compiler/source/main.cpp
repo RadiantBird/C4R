@@ -28,6 +28,10 @@ enum class TokenType {
     Assign,
     Reserved,
     FormatString,
+
+    Comma,
+    Dot,
+    Operator,
 };
 
 using std::print;
@@ -40,13 +44,21 @@ using std::unique_ptr;
 
 unordered_map<string, bool> StandardType = {
     {"int32", true},
+    {"int", true},
+    {"bool", true},
     {"void", true},
 };
 
 unordered_map<string, bool> ReservedWord = {
-    {"const", true},
-    {"mutable", true},
+    {"if", true},
+    {"for", true},
+    {"while", true},
+    {"do", true},
     {"return", true},
+    {"capture", true},
+
+    {"const", true},
+    {"mutable", true},    
 };
 
 std::string tokenTypeToString(TokenType type) {
@@ -83,6 +95,10 @@ std::string tokenTypeToString(TokenType type) {
         return "Reserved";
     case TokenType::FormatString:
         return "FormatString";
+    case TokenType::Comma:
+        return "Comma";
+    case TokenType::Dot:
+        return "Dot";
 
     default:
         return "Invalid";
@@ -94,7 +110,7 @@ bool isIdentifier(char c) {
 }
 
 bool isWhitespace(char c) {
-    return c == ' ' || c == '\t' || c == '\n';
+    return std::isspace(static_cast<unsigned char>(c)) != 0;
 }
 
 bool isNumeric(const string& s) {
@@ -114,9 +130,13 @@ struct Token {
     string value;
 };
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::cerr << "Usage: C4R <source.c4r>\n";
+        return 1;
+    }
     string source = "";
-    string target = "playground/var.c4r";
+    string target = argv[1];
 
     {
         std::ifstream file(target);
@@ -181,9 +201,37 @@ int main() {
                     continue;
                 }
 
+                if (c == '/' && position < source.size() && source[position] == '/') {
+                    while (position < source.size() && source[position] != '\n') ++position;
+                    continue;
+                }
+                if (std::isdigit(static_cast<unsigned char>(c))) {
+                    string number(1, c);
+                    while (position < source.size() && std::isdigit(static_cast<unsigned char>(source[position])))
+                        number += source[position++];
+                    return {TokenType::Number, number};
+                }
+                if (string("+-*/%`!~<>=&|^").find(c) != string::npos) {
+                    string op(1, c);
+                    static const vector<string> ops = {"!&&", "!||", "<<=", ">>=", "++", "--", "==", "!=", "<=", ">=", "<<", ">>", "&&", "||", "^^", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^="};
+                    for (const auto& candidate : ops) {
+                        if (candidate[0] == c && source.compare(position, candidate.size() - 1, candidate, 1, candidate.size() - 1) == 0) {
+                            position += candidate.size() - 1;
+                            return {TokenType::Operator, candidate};
+                        }
+                    }
+                    return {c == '=' ? TokenType::Assign : TokenType::Operator, op};
+                }
+
                 switch (c) {
                 case ';':
                     return { TokenType::EndOfStatement, ";" };
+
+                case ',':
+                    return { TokenType::Comma, "," };
+
+                case '.':
+                    return { TokenType::Dot, "." };
 
                 case '(':
                     return { TokenType::LeftParen, "(" };
@@ -199,9 +247,6 @@ int main() {
 
                 case '}':
                     return {TokenType::RightBrace, "}"};
-
-                case '=':
-                    return {TokenType::Assign, "="};
 
                 default:
                     if (c == 'f' && position < source.size() && source[position] == '"') {
@@ -260,7 +305,6 @@ int main() {
         void Advance() {
             try {
                 currentToken = lexer.NextToken();
-                print("{}, {}\n", tokenTypeToString(currentToken.type), currentToken.value);
             }
             catch (const std::exception& e) {
                 throw std::runtime_error(std::format("Lexer Error: {}\n", e.what()));
@@ -271,6 +315,94 @@ int main() {
             if (currentToken.type != type) {
                 throw std::runtime_error("Unexpected token");
             }
+        }
+
+        static int Precedence(const string& op) {
+            if (op == "=" || op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" || op == "&=" || op == "|=" || op == "^=" || op == "<<=" || op == ">>=") return 1;
+            if (op == "!||") return 2;
+            if (op == "!&&") return 3;
+            if (op == "||") return 4;
+            if (op == "^^") return 5;
+            if (op == "&&") return 6;
+            if (op == "|") return 7;
+            if (op == "^") return 8;
+            if (op == "&") return 9;
+            if (op == "==" || op == "!=") return 10;
+            if (op == "<" || op == "<=" || op == ">" || op == ">=") return 11;
+            if (op == "<<" || op == ">>") return 12;
+            if (op == "+" || op == "-") return 13;
+            if (op == "*" || op == "/" || op == "%") return 14;
+            if (op == "`") return 15;
+            return 0;
+        }
+
+        unique_ptr<Expression> ParseExpression(int minPrecedence = 1) {
+            unique_ptr<Expression> left;
+            if (currentToken.type == TokenType::Operator &&
+                (currentToken.value == "+" || currentToken.value == "-" || currentToken.value == "!" || currentToken.value == "~" || currentToken.value == "++" || currentToken.value == "--")) {
+                auto unary = std::make_unique<UnaryExpr>();
+                unary->op = currentToken.value;
+                Advance();
+                unary->operand = ParseExpression(16);
+                left = std::move(unary);
+            } else if (currentToken.type == TokenType::LeftParen) {
+                Advance();
+                left = ParseExpression();
+                Expect(TokenType::RightParen);
+                Advance();
+            } else if (currentToken.type == TokenType::Number) {
+                auto value = std::make_unique<NumericLiteral>();
+                value->value = currentToken.value;
+                Advance();
+                left = std::move(value);
+            } else if (currentToken.type == TokenType::Identifier) {
+                if (currentToken.value == "true" || currentToken.value == "false") {
+                    auto value = std::make_unique<BooleanLiteral>();
+                    value->value = currentToken.value == "true";
+                    left = std::move(value);
+                } else {
+                    auto value = std::make_unique<IdentifierExpr>();
+                    value->name = currentToken.value;
+                    left = std::move(value);
+                }
+                Advance();
+            } else {
+                throw std::runtime_error("Expected expression, found: " + currentToken.value);
+            }
+            while (true) {
+                if (currentToken.type == TokenType::Operator && (currentToken.value == "++" || currentToken.value == "--") && minPrecedence <= 17) {
+                    auto unary = std::make_unique<UnaryExpr>();
+                    unary->op = currentToken.value;
+                    unary->postfix = true;
+                    unary->operand = std::move(left);
+                    Advance();
+                    left = std::move(unary);
+                    continue;
+                }
+                const int precedence = Precedence(currentToken.value);
+                if (!precedence || precedence < minPrecedence) break;
+                string op = currentToken.value;
+                Advance();
+                if (precedence == 10 || precedence == 11) {
+                    auto chain = std::make_unique<ComparisonExpr>();
+                    chain->operands.push_back(std::move(left));
+                    do {
+                        chain->operators.push_back(op);
+                        chain->operands.push_back(ParseExpression(12));
+                        if (Precedence(currentToken.value) != 10 && Precedence(currentToken.value) != 11) break;
+                        op = currentToken.value;
+                        Advance();
+                    } while (true);
+                    left = std::move(chain);
+                } else {
+                    auto binary = std::make_unique<BinaryExpr>();
+                    binary->op = op;
+                    binary->left = std::move(left);
+                    binary->right = ParseExpression(precedence + (precedence == 1 || op == "`" ? 0 : 1));
+                    left = std::move(binary);
+                }
+            }
+            return left;
         }
 
         void ParseStringStatement(vector<unique_ptr<ASTNode>>& destination) {
@@ -390,8 +522,19 @@ int main() {
                         currentToken.value == "const")) {
                     ParseVariableDeclaration(function.body);
                 }
+                else if (currentToken.value == "return") {
+                    Advance();
+                    auto statement = std::make_unique<ReturnStatement>();
+                    if (currentToken.type != TokenType::EndOfStatement) statement->value = ParseExpression();
+                    Expect(TokenType::EndOfStatement);
+                    Advance();
+                    function.body.push_back(std::move(statement));
+                }
                 else {
-                    throw std::runtime_error("Unknown statement in function");
+                    auto expression = ParseExpression();
+                    Expect(TokenType::EndOfStatement);
+                    Advance();
+                    function.body.push_back(std::move(expression));
                 }
             }
 
@@ -432,15 +575,7 @@ int main() {
             Expect(TokenType::Assign);
             Advance();
 
-            if (currentToken.type == TokenType::Number) {
-                auto numeric = std::make_unique<NumericLiteral>();
-                numeric->value = currentToken.value;
-                variable.initialValue = std::move(numeric);
-                Advance();
-            }
-            else {
-                throw std::runtime_error("Expected numeric literal");
-            }
+            variable.initialValue = ParseExpression();
 
             Expect(TokenType::EndOfStatement);
             Advance();
@@ -448,6 +583,13 @@ int main() {
             destination.push_back(
                 std::make_unique<VariableDeclaration>(std::move(variable))
             );
+        }
+
+        void ParseControlStructure() {
+            Expect(TokenType::Reserved);
+            Advance();
+
+            Expect(TokenType::LeftParen);
         }
 
     public:
@@ -463,10 +605,27 @@ int main() {
                     ParseStringStatement(program.children);
                 }
                 else if (currentToken.type == TokenType::TypeName) {
-                    ParseFunctionStatement();
+                    Lexer lookahead = lexer;
+                    Token next = lookahead.NextToken();
+                    if (next.value == "mutable") next = lookahead.NextToken();
+                    if (next.type != TokenType::Identifier) throw std::runtime_error("Expected identifier");
+                    if (lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement();
+                    else ParseVariableDeclaration(program.children);
+                }
+                else if (currentToken.value == "const") {
+                    ParseVariableDeclaration(program.children);
+                }
+                else if (currentToken.type == TokenType::FormatString) {
+                    ParseFormatStringStatement(program.children);
+                }
+                else if (currentToken.type == TokenType::Reserved) {
+                    throw std::runtime_error("Unsupported top-level statement: " + currentToken.value);
                 }
                 else {
-                    throw std::runtime_error("Unknown statement");
+                    auto expression = ParseExpression();
+                    Expect(TokenType::EndOfStatement);
+                    Advance();
+                    program.children.push_back(std::move(expression));
                 }
             }
         }

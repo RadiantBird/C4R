@@ -1,6 +1,7 @@
 param(
     [string]$mode = "build",
-    [string]$exe  = "C4R"
+    [string]$exe  = "C4R",
+    [string]$source = "playground/var.c4r"
 )
 
 function _init {
@@ -36,7 +37,10 @@ function _build {
 }
 
 function _run {
-    & ".\build\Debug\$($exe).exe"
+    & ".\build\Debug\$($exe).exe" $source
+    if ($LASTEXITCODE -ne 0) {
+        throw "Compiler failed with exit code $LASTEXITCODE"
+    }
 }
 
 if ($mode -in @("build", "exec")) {

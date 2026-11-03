@@ -1,0 +1,7 @@
+int32 main() {
+    int32 a = 4;
+    int32 b = 6;
+    int32 c = a + b;
+    f"{a}+{b}={c}\n";
+    return 0;
+}

@@ -30,6 +30,21 @@ struct NumericLiteral : Expression {
     std::string value;
 };
 
+struct BooleanLiteral : Expression { bool value = false; };
+struct UnaryExpr : Expression {
+    std::string op;
+    std::unique_ptr<Expression> operand;
+    bool postfix = false;
+};
+struct BinaryExpr : Expression {
+    std::string op;
+    std::unique_ptr<Expression> left, right;
+};
+struct ComparisonExpr : Expression {
+    std::vector<std::string> operators;
+    std::vector<std::unique_ptr<Expression>> operands;
+};
+
 struct VariableDeclaration : ASTNode {
     std::string name;
     std::string type;
@@ -40,6 +55,14 @@ struct VariableDeclaration : ASTNode {
 
 struct IdentifierExpr : Expression {
     std::string name;
+};
+
+struct ReturnStatement : ASTNode {
+    std::unique_ptr<Expression> value;
+};
+
+struct IfExpr : Expression {
+
 };
 
 struct FormatText : ASTNode {
