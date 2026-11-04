@@ -1,0 +1,21 @@
+{
+  "name": "c4r-language",
+  "displayName": "C4R Language",
+  "description": "C4R language support using the C4R compiler for diagnostics.",
+  "version": "0.1.0",
+  "publisher": "c4r-local",
+  "engines": { "vscode": "^1.85.0" },
+  "main": "./extension.js",
+  "activationEvents": ["onLanguage:c4r"],
+  "contributes": {
+    "languages": [{ "id": "c4r", "aliases": ["C4R"], "extensions": [".c4r"], "configuration": "./language-configuration.json" }],
+    "grammars": [{ "language": "c4r", "scopeName": "source.c4r", "path": "./syntaxes/c4r.tmLanguage.json" }],
+    "configuration": {
+      "title": "C4R",
+      "properties": {
+        "c4r.compilerPath": { "type": "string", "default": "", "description": "Path to the C4R compiler executable. Defaults to compiler/build/Debug/C4R.exe in the workspace." },
+        "c4r.checkDelay": { "type": "number", "default": 500, "minimum": 100, "description": "Delay in milliseconds before checking changes." }
+      }
+    }
+  }
+}

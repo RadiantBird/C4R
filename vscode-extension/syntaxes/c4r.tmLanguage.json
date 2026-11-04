@@ -1,0 +1,18 @@
+{
+  "name": "C4R",
+  "scopeName": "source.c4r",
+  "patterns": [
+    { "name": "comment.line.double-slash.c4r", "begin": "//", "end": "$" },
+    { "name": "string.quoted.double.c4r", "begin": "(?:\\b[fc])?\"", "end": "\"", "patterns": [
+      { "name": "constant.character.escape.c4r", "match": "\\\\." },
+      { "name": "constant.other.placeholder.c4r", "match": "\\{[^{}]*\\}" }
+    ] },
+    { "name": "storage.type.primitive.c4r", "match": "\\b(?:int|int32|bool|void)\\b" },
+    { "name": "storage.modifier.c4r", "match": "\\b(?:const|mutable|capture)\\b" },
+    { "name": "keyword.control.c4r", "match": "\\b(?:if|else|for|while|do|return|break|continue)\\b" },
+    { "name": "constant.language.boolean.c4r", "match": "\\b(?:true|false)\\b" },
+    { "name": "constant.numeric.c4r", "match": "\\b[0-9]+\\b" },
+    { "name": "entity.name.function.c4r", "match": "\\b[a-zA-Z_][a-zA-Z0-9_]*(?=\\s*\\()" },
+    { "name": "keyword.operator.c4r", "match": "!&&|!\\|\\||\\+\\+|--|==|!=|<=|>=|<<=?|>>=?|&&|\\|\\||\\^\\^|[+*/%`!~<>=&|^\\-]=?" }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run C4R extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+                "C:\\Users\\Ryarta\\Documents\\C4R\\compiler\\playground",
+                "--extensionDevelopmentPath=${workspaceFolder}"
+            ]
+    }
+  ]
+}

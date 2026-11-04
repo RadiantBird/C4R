@@ -18,6 +18,7 @@ public:
 
     void Generate(const Program& program);
     void Print();
+    size_t DiagnosticOffset() const { return diagnosticOffset; }
     void WriteObject(const std::filesystem::path& path);
     void LinkExecutable(
         const std::filesystem::path& objectPath,
@@ -28,8 +29,21 @@ private:
     llvm::LLVMContext Context;
     llvm::Module Module;
     llvm::IRBuilder<> Builder;
-    struct Variable { llvm::AllocaInst* storage; llvm::Type* type; bool isMutable; };
+    size_t diagnosticOffset = 0;
+    struct Variable { llvm::Value* storage; llvm::Type* type; bool isMutable; size_t id; };
     std::unordered_map<std::string, Variable> variables;
+    std::unordered_map<size_t, Variable> bindings;
+    size_t nextVariableId = 0;
+    size_t nextFunctionId = 0;
+    struct Capture { std::string name; Variable variable; };
+    struct FunctionSymbol {
+        llvm::Function* function;
+        const FunctionDeclaration* declaration;
+        std::vector<Capture> captures;
+    };
+    std::unordered_map<std::string, std::shared_ptr<FunctionSymbol>> functions;
+    std::unordered_set<std::string> inaccessibleVariables;
+    std::unordered_set<const CaptureDeclaration*> validCaptures;
     struct ValueScope {
         llvm::BasicBlock* exit;
         llvm::Type* type = nullptr;
@@ -46,6 +60,9 @@ private:
     llvm::Value* EmitValueBlock(const Block& block);
     llvm::Value* FinishValueScope(ValueScope& scope);
     llvm::Value* EmitCondition(const Expression& expression);
+    llvm::Value* EmitCall(const std::string& name, const std::vector<std::unique_ptr<Expression>>& arguments);
+    std::shared_ptr<FunctionSymbol> DeclareFunction(const FunctionDeclaration& declaration, bool local);
+    void EmitFunctionBody(const std::shared_ptr<FunctionSymbol>& symbol);
 
     llvm::Type* GetType(const std::string& name);
 
@@ -56,8 +73,6 @@ private:
     void EmitBody(
         const std::vector<std::unique_ptr<ASTNode>>& body
     );
-
-    void EmitFunction(const FunctionDeclaration& declaration);
 
     void EmitImplicitMain(const Program& program);
 };

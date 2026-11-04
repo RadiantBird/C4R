@@ -7,6 +7,8 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <fcntl.h>
+#include <io.h>
 // #include <cstdlib>
 // #include <utility>
 
@@ -131,18 +133,27 @@ bool isNumeric(const string& s) {
 struct Token {
     TokenType type;
     string value;
+    size_t offset = 0;
 };
 
+constexpr int PostfixPrecedence = 17;
+
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::cerr << "Usage: C4R <source.c4r>\n";
+    bool symbols = argc == 4 && string(argv[1]) == "--symbols";
+    bool check = (argc == 3 && string(argv[1]) == "--check") || symbols;
+    if ((!check && argc != 2) || (argc == 2 && (string(argv[1]) == "--check" || string(argv[1]) == "--symbols"))) {
+        std::cerr << "Usage: C4R [--check] <source.c4r|-> | --symbols <byte-offset> -\n";
         return 1;
     }
     string source = "";
-    string target = argv[1];
+    string target = argv[symbols ? 3 : check ? 2 : 1];
 
     {
-        std::ifstream file(target);
+        if (check && target == "-") {
+            _setmode(_fileno(stdin), _O_BINARY);
+            source.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
+        } else {
+        std::ifstream file(target, std::ios::binary);
 
         if (!file) {
             print("Failed to open source file\n");
@@ -153,12 +164,14 @@ int main(int argc, char** argv) {
             std::istreambuf_iterator<char>(file),
             std::istreambuf_iterator<char>()
         );
+        }
     }
 
     class Lexer {
     private:
         const std::string& source;
         size_t position = 0;
+        size_t tokenStart = 0;
 
         Token ParseString(TokenType type) {
             string value;
@@ -197,12 +210,18 @@ int main(int argc, char** argv) {
             : source(source) {}
 
         Token NextToken() {
+            Token token = ReadToken();
+            token.offset = tokenStart;
+            return token;
+        }
+        Token ReadToken() {
             while (position < source.size()) {
                 char c = source[position++];
 
                 if (isWhitespace(c)) {
                     continue;
                 }
+                tokenStart = position - 1;
 
                 if (c == '/' && position < source.size() && source[position] == '/') {
                     while (position < source.size() && source[position] != '\n') ++position;
@@ -296,6 +315,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            tokenStart = position;
             return { TokenType::EndOfFile, "" };
         }
     };
@@ -340,6 +360,7 @@ int main(int argc, char** argv) {
         }
 
         unique_ptr<Expression> ParseExpression(int minPrecedence = 1) {
+            const size_t expressionOffset = currentToken.offset;
             unique_ptr<Expression> left;
             if (currentToken.type == TokenType::Operator &&
                 (currentToken.value == "+" || currentToken.value == "-" || currentToken.value == "!" || currentToken.value == "~" || currentToken.value == "++" || currentToken.value == "--")) {
@@ -390,14 +411,33 @@ int main(int argc, char** argv) {
             } else {
                 throw std::runtime_error("Expected expression, found: " + currentToken.value);
             }
+            left->offset = expressionOffset;
             while (true) {
-                if (currentToken.type == TokenType::Operator && (currentToken.value == "++" || currentToken.value == "--") && minPrecedence <= 17) {
+                if (currentToken.type == TokenType::LeftParen && minPrecedence <= PostfixPrecedence) {
+                    auto* identifier = dynamic_cast<IdentifierExpr*>(left.get());
+                    if (!identifier) throw std::runtime_error("Function call requires a function name");
+                    auto call = std::make_unique<CallExpr>();
+                    call->name = identifier->name;
+                    Advance();
+                    if (currentToken.type != TokenType::RightParen) {
+                        do {
+                            call->arguments.push_back(ParseExpression());
+                            if (currentToken.type != TokenType::Comma) break;
+                            Advance();
+                        } while (true);
+                    }
+                    Expect(TokenType::RightParen); Advance();
+                    left = std::move(call);
+                    continue;
+                }
+                if (currentToken.type == TokenType::Operator && (currentToken.value == "++" || currentToken.value == "--") && minPrecedence <= PostfixPrecedence) {
                     auto unary = std::make_unique<UnaryExpr>();
                     unary->op = currentToken.value;
                     unary->postfix = true;
                     unary->operand = std::move(left);
                     Advance();
                     left = std::move(unary);
+                    left->offset = expressionOffset;
                     continue;
                 }
                 const int precedence = Precedence(currentToken.value);
@@ -415,14 +455,17 @@ int main(int argc, char** argv) {
                         Advance();
                     } while (true);
                     left = std::move(chain);
+                    left->offset = expressionOffset;
                 } else {
                     auto binary = std::make_unique<BinaryExpr>();
                     binary->op = op;
                     binary->left = std::move(left);
                     binary->right = ParseExpression(precedence + (precedence == 1 || op == "`" ? 0 : 1));
                     left = std::move(binary);
+                    left->offset = expressionOffset;
                 }
             }
+            left->offset = expressionOffset;
             return left;
         }
 
@@ -519,7 +562,26 @@ int main(int argc, char** argv) {
         void ParseStatement(vector<unique_ptr<ASTNode>>& destination) {
             if (currentToken.type == TokenType::String) { ParseStringStatement(destination); return; }
             if (currentToken.type == TokenType::FormatString) { ParseFormatStringStatement(destination); return; }
-            if (currentToken.type == TokenType::TypeName || currentToken.value == "const") { ParseVariableDeclaration(destination); return; }
+            if (currentToken.type == TokenType::TypeName) {
+                Lexer lookahead = lexer;
+                Token name = lookahead.NextToken();
+                if (name.type == TokenType::Identifier && lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement(destination);
+                else ParseVariableDeclaration(destination);
+                return;
+            }
+            if (currentToken.value == "const") { ParseVariableDeclaration(destination); return; }
+            if (currentToken.value == "capture") {
+                auto capture = std::make_unique<CaptureDeclaration>();
+                Advance();
+                do {
+                    Expect(TokenType::Identifier);
+                    capture->names.push_back(currentToken.value); Advance();
+                    if (currentToken.type != TokenType::Comma) break;
+                    Advance();
+                } while (true);
+                Expect(TokenType::EndOfStatement); Advance();
+                destination.push_back(std::move(capture)); return;
+            }
             if (currentToken.type == TokenType::LeftBrace) { destination.push_back(ParseBlock()); return; }
             if (currentToken.value == "return") {
                 Advance();
@@ -588,7 +650,7 @@ int main(int argc, char** argv) {
             destination.push_back(std::move(expression));
         }
 
-        void ParseFunctionStatement() {
+        void ParseFunctionStatement(vector<unique_ptr<ASTNode>>& destination) {
             Expect(TokenType::TypeName);
             string typev = currentToken.value;
             Advance();
@@ -600,22 +662,33 @@ int main(int argc, char** argv) {
             Expect(TokenType::LeftParen);
             Advance();
 
-            Expect(TokenType::RightParen);
-            Advance();
-
             FunctionDeclaration function;
             function.name = ident;
             function.returnType = typev;
 
+            if (currentToken.type != TokenType::RightParen) {
+                do {
+                    FunctionDeclaration::Parameter parameter;
+                    Expect(TokenType::TypeName); parameter.type = currentToken.value; Advance();
+                    if (currentToken.value == "mutable") { parameter.isMutable = true; Advance(); }
+                    Expect(TokenType::Identifier); parameter.name = currentToken.value; Advance();
+                    function.parameters.push_back(std::move(parameter));
+                    if (currentToken.type != TokenType::Comma) break;
+                    Advance();
+                } while (true);
+            }
+            Expect(TokenType::RightParen); Advance();
+
             function.body = std::move(ParseBlock()->statements);
 
-            program.children.push_back(
+            destination.push_back(
                 std::make_unique<FunctionDeclaration>(std::move(function))
             );
         }
 
         void ParseVariableDeclaration(vector<unique_ptr<ASTNode>>& destination) {
             VariableDeclaration variable;
+            variable.offset = currentToken.offset;
 
             if (currentToken.type == TokenType::Reserved &&
                 currentToken.value == "const") {
@@ -655,6 +728,7 @@ int main(int argc, char** argv) {
         }
 
     public:
+        size_t DiagnosticOffset() const { return currentToken.offset; }
         Program program;
         Parser(Lexer& lexer)
             : lexer(lexer) {
@@ -671,7 +745,7 @@ int main(int argc, char** argv) {
                     Token next = lookahead.NextToken();
                     if (next.value == "mutable") next = lookahead.NextToken();
                     if (next.type != TokenType::Identifier) throw std::runtime_error("Expected identifier");
-                    if (lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement();
+                    if (lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement(program.children);
                     else ParseVariableDeclaration(program.children);
                 }
                 else if (currentToken.value == "const") {
@@ -687,7 +761,83 @@ int main(int argc, char** argv) {
         }
     };
 
+    size_t diagnosticOffset = 0;
     try {
+        if (symbols) {
+            size_t limit = std::min(static_cast<size_t>(std::stoull(argv[2])), source.size());
+            string prefix = source.substr(0, limit);
+            Lexer lexer(prefix);
+            vector<Token> tokens;
+            try {
+                while (true) {
+                    Token token = lexer.NextToken();
+                    if (token.type == TokenType::EndOfFile) break;
+                    tokens.push_back(std::move(token));
+                }
+            } catch (const std::exception&) { /* Incomplete input is normal while editing. */ }
+            struct Symbol { string kind, name, detail; };
+            vector<vector<Symbol>> scopes(1);
+            vector<Symbol> parameters;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (tokens[i].type == TokenType::LeftBrace) {
+                    scopes.push_back(std::move(parameters)); parameters.clear();
+                } else if (tokens[i].type == TokenType::RightBrace) {
+                    if (scopes.size() > 1) scopes.pop_back();
+                    parameters.clear();
+                } else if (tokens[i].type == TokenType::TypeName && i + 1 < tokens.size()) {
+                    size_t j = i + 1;
+                    bool isMutable = tokens[j].value == "mutable";
+                    if (isMutable) ++j;
+                    if (j >= tokens.size() || tokens[j].type != TokenType::Identifier) continue;
+                    string type = tokens[i].value, name = tokens[j].value;
+                    if (j + 1 < tokens.size() && tokens[j + 1].type == TokenType::LeftParen) {
+                        string detail = type + " " + name + "(";
+                        vector<Symbol> args;
+                        size_t k = j + 2;
+                        while (k < tokens.size() && tokens[k].type != TokenType::RightParen) {
+                            if (tokens[k].type != TokenType::TypeName || k + 1 >= tokens.size()) break;
+                            string argType = tokens[k++].value;
+                            bool argMutable = tokens[k].value == "mutable";
+                            if (argMutable) ++k;
+                            if (k >= tokens.size() || tokens[k].type != TokenType::Identifier) break;
+                            if (!args.empty()) detail += ", ";
+                            detail += argType + (argMutable ? " mutable " : " ") + tokens[k].value;
+                            args.push_back({"variable", tokens[k].value, argType + (argMutable ? " mutable" : "")});
+                            ++k;
+                            if (k < tokens.size() && tokens[k].type == TokenType::Comma) ++k;
+                            else break;
+                        }
+                        detail += ")";
+                        scopes.back().push_back({"function", name, detail});
+                        if (k < tokens.size() && tokens[k].type == TokenType::RightParen) { parameters = std::move(args); i = k; }
+                    } else {
+                        scopes.back().push_back({"variable", name, type + (isMutable ? " mutable" : "")});
+                        i = j;
+                    }
+                }
+            }
+            std::unordered_set<string> seen;
+            for (auto scope = scopes.rbegin(); scope != scopes.rend(); ++scope) {
+                for (auto symbol = scope->rbegin(); symbol != scope->rend(); ++symbol) {
+                    if (seen.insert(symbol->name).second)
+                        std::cout << "C4R_SYMBOL\t" << symbol->kind << '\t' << symbol->name << '\t' << symbol->detail << '\n';
+                }
+            }
+            for (const auto& [name, unused] : StandardType) std::cout << "C4R_SYMBOL\ttype\t" << name << "\t" << name << '\n';
+            for (const auto& [name, unused] : ReservedWord) std::cout << "C4R_SYMBOL\tkeyword\t" << name << "\t" << name << '\n';
+            for (const auto* name : {"true", "false"}) std::cout << "C4R_SYMBOL\tkeyword\t" << name << "\tbool\n";
+            return 0;
+        }
+        if (check) {
+            Lexer lexer(source);
+            Parser parser(lexer);
+            try { parser.ParseProgram(); }
+            catch (...) { diagnosticOffset = parser.DiagnosticOffset(); throw; }
+            LLVM llvm;
+            try { llvm.Generate(parser.program); }
+            catch (...) { diagnosticOffset = llvm.DiagnosticOffset(); throw; }
+            return 0;
+        }
         print("Compiling {}...\n", target);
 
         print("Parsing program...\n");
@@ -714,6 +864,12 @@ int main(int argc, char** argv) {
         print("Generated {}\n", executablePath.string());
     }
     catch (const std::exception& e) {
+        if (check) {
+            string message = e.what();
+            for (char& c : message) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            std::cerr << "C4R_DIAGNOSTIC\t" << diagnosticOffset << "\t" << message << '\n';
+            return 1;
+        }
         print("Compilation Error: {}\n", e.what());
         return -1;
     }

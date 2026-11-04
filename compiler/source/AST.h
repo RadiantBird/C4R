@@ -5,6 +5,7 @@
 #include <memory>
 
 struct ASTNode {
+    size_t offset = 0;
     virtual ~ASTNode() = default;
 };
 
@@ -13,8 +14,10 @@ struct StringStatement : ASTNode {
 };
 
 struct FunctionDeclaration : ASTNode {
+    struct Parameter { std::string type, name; bool isMutable = false; };
     std::string name;
     std::string returnType = "void";
+    std::vector<Parameter> parameters;
     std::vector<std::unique_ptr<ASTNode>> body;
 };
 
@@ -56,6 +59,13 @@ struct VariableDeclaration : ASTNode {
 struct IdentifierExpr : Expression {
     std::string name;
 };
+
+struct CallExpr : Expression {
+    std::string name;
+    std::vector<std::unique_ptr<Expression>> arguments;
+};
+
+struct CaptureDeclaration : ASTNode { std::vector<std::string> names; };
 
 struct ReturnStatement : ASTNode {
     std::unique_ptr<Expression> value;

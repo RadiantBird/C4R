@@ -99,6 +99,7 @@ LLVM::Variable& LLVM::MutableVariable(const Expression& expression) {
 }
 
 llvm::Value* LLVM::EmitBinary(const std::string& op, llvm::Value* left, llvm::Value* right) {
+    if (left->getType()->isVoidTy() || right->getType()->isVoidTy()) throw std::runtime_error("Void expression cannot be used as an operand");
     if (left->getType() != right->getType()) throw std::runtime_error("Operand types do not match for " + op);
     if (op == "==") return Builder.CreateICmpEQ(left, right);
     if (op == "!=") return Builder.CreateICmpNE(left, right);
@@ -169,7 +170,31 @@ void LLVM::EmitVariable(const VariableDeclaration& declaration) {
     llvm::IRBuilder<> entryBuilder(&entry, entry.begin());
     auto* storage = entryBuilder.CreateAlloca(type, nullptr, declaration.name);
     Builder.CreateStore(value, storage);
-    variables[declaration.name] = Variable{storage, type, declaration.isMutable};
+    Variable variable{storage, type, declaration.isMutable, nextVariableId++};
+    variables.insert_or_assign(declaration.name, variable);
+    bindings.insert_or_assign(variable.id, variable);
+}
+
+llvm::Value* LLVM::EmitCall(const std::string& name, const std::vector<std::unique_ptr<Expression>>& arguments) {
+    if (variables.contains(name)) throw std::runtime_error("Variable is not callable: " + name);
+    if (inaccessibleVariables.contains(name)) throw std::runtime_error("Variable requires capture: " + name);
+    auto it = functions.find(name);
+    if (it == functions.end()) throw std::runtime_error("Undefined function: " + name);
+    auto symbol = it->second;
+    const auto& parameters = symbol->declaration->parameters;
+    if (arguments.size() != parameters.size()) throw std::runtime_error("Wrong number of arguments for function: " + name);
+    std::vector<llvm::Value*> values;
+    for (const auto& capture : symbol->captures) {
+        auto binding = bindings.find(capture.variable.id);
+        if (binding == bindings.end()) throw std::runtime_error("Capture is not available in this function: " + capture.name);
+        values.push_back(binding->second.storage);
+    }
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        auto* value = EmitExpression(*arguments[i]);
+        if (value->getType() != GetType(parameters[i].type)) throw std::runtime_error("Argument type mismatch for function: " + name);
+        values.push_back(value);
+    }
+    return Builder.CreateCall(symbol->function, values);
 }
 
 llvm::Value* LLVM::FinishValueScope(ValueScope& scope) {
@@ -191,6 +216,8 @@ llvm::Value* LLVM::EmitValueBlock(const Block& block) {
 }
 
 llvm::Value* LLVM::EmitExpression(const Expression& expression) {
+    diagnosticOffset = expression.offset;
+    if (auto* call = dynamic_cast<const CallExpr*>(&expression)) return EmitCall(call->name, call->arguments);
     if (auto* block = dynamic_cast<const BlockExpr*>(&expression)) return EmitValueBlock(*block->block);
     if (auto* branch = dynamic_cast<const IfExpr*>(&expression)) {
         auto* condition = EmitCondition(*branch->condition);
@@ -217,7 +244,14 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
     if (auto* literal = dynamic_cast<const BooleanLiteral*>(&expression)) return Builder.getInt1(literal->value);
     if (auto* identifier = dynamic_cast<const IdentifierExpr*>(&expression)) {
         auto it = variables.find(identifier->name);
-        if (it == variables.end()) throw std::runtime_error("Undefined variable: " + identifier->name);
+        if (it == variables.end()) {
+            if (inaccessibleVariables.contains(identifier->name)) throw std::runtime_error("Variable requires capture: " + identifier->name);
+            if (functions.contains(identifier->name)) {
+                std::vector<std::unique_ptr<Expression>> noArguments;
+                return EmitCall(identifier->name, noArguments);
+            }
+            throw std::runtime_error("Undefined variable: " + identifier->name);
+        }
         return Builder.CreateLoad(it->second.type, it->second.storage, identifier->name + ".value");
     }
     if (auto* unary = dynamic_cast<const UnaryExpr*>(&expression)) {
@@ -264,7 +298,7 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
     if (auto* binary = dynamic_cast<const BinaryExpr*>(&expression)) {
         const auto& op = binary->op;
         if (op == "=" || op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" || op == "&=" || op == "|=" || op == "^=" || op == "<<=" || op == ">>=") {
-            auto& var = MutableVariable(*binary->left);
+            auto var = MutableVariable(*binary->left);
             auto* old = op == "=" ? nullptr : Builder.CreateLoad(var.type, var.storage);
             auto* value = EmitExpression(*binary->right);
             if (value->getType() != var.type) throw std::runtime_error("Assignment type mismatch");
@@ -302,6 +336,9 @@ void LLVM::EmitBody(
     const std::vector<std::unique_ptr<ASTNode>>& body
 ) {
     auto outerVariables = variables;
+    auto outerBindings = bindings;
+    auto outerFunctions = functions;
+    auto outerInaccessible = inaccessibleVariables;
     std::unordered_set<std::string> localNames;
 
     auto* pointerType = llvm::PointerType::getUnqual(Context);
@@ -322,8 +359,23 @@ void LLVM::EmitBody(
     );
 
     for (const auto& node : body) {
+        diagnosticOffset = node->offset;
 
-        if (dynamic_cast<FunctionDeclaration*>(node.get())) continue;
+        if (auto* declaration = dynamic_cast<FunctionDeclaration*>(node.get())) {
+            auto existing = functions.find(declaration->name);
+            if (existing != functions.end() && existing->second->declaration == declaration) continue;
+            if (!localNames.insert(declaration->name).second) throw std::runtime_error("Duplicate declaration: " + declaration->name);
+            variables.erase(declaration->name);
+            inaccessibleVariables.erase(declaration->name);
+            auto symbol = DeclareFunction(*declaration, true);
+            functions[declaration->name] = symbol;
+            EmitFunctionBody(symbol);
+            continue;
+        }
+        if (auto* capture = dynamic_cast<CaptureDeclaration*>(node.get())) {
+            if (!validCaptures.contains(capture)) throw std::runtime_error("capture must be declared directly in a local function");
+            continue;
+        }
         if (Builder.GetInsertBlock()->hasTerminator()) {
             throw std::runtime_error("Unreachable statement after return");
         }
@@ -331,6 +383,7 @@ void LLVM::EmitBody(
             if (!valueScopes.empty()) {
                 if (!statement->value) throw std::runtime_error("Value scope requires a return value");
                 auto* value = EmitExpression(*statement->value);
+                if (value->getType()->isVoidTy()) throw std::runtime_error("Value scope cannot return void");
                 auto& scope = *valueScopes.back();
                 if (scope.type && scope.type != value->getType()) throw std::runtime_error("Value scope return types do not match");
                 scope.type = value->getType();
@@ -371,6 +424,7 @@ void LLVM::EmitBody(
         }
         else if (auto* loop = dynamic_cast<LoopStatement*>(node.get())) {
             auto savedVariables = variables;
+            auto savedBindings = bindings;
             if (auto* declaration = dynamic_cast<VariableDeclaration*>(loop->initializer.get())) EmitVariable(*declaration);
             else if (auto* initializer = dynamic_cast<Expression*>(loop->initializer.get())) EmitExpression(*initializer);
             auto* fn = Builder.GetInsertBlock()->getParent();
@@ -392,6 +446,7 @@ void LLVM::EmitBody(
             Builder.CreateBr(conditionBlock);
             Builder.SetInsertPoint(done);
             variables = std::move(savedVariables);
+            bindings = std::move(savedBindings);
         }
         else if (auto* control = dynamic_cast<LoopControl*>(node.get())) {
             if (loops.empty()) throw std::runtime_error("break or continue outside loop");
@@ -489,54 +544,101 @@ void LLVM::EmitBody(
         }
     }
     variables = std::move(outerVariables);
+    bindings = std::move(outerBindings);
+    functions = std::move(outerFunctions);
+    inaccessibleVariables = std::move(outerInaccessible);
 }
 
-void LLVM::EmitFunction(const FunctionDeclaration& declaration) {
-    if (Module.getFunction(declaration.name)) {
-        throw std::runtime_error(
-            "Duplicate function: " + declaration.name
-        );
+std::shared_ptr<LLVM::FunctionSymbol> LLVM::DeclareFunction(const FunctionDeclaration& declaration, bool local) {
+    std::vector<Capture> captures;
+    std::unordered_set<std::string> names;
+    for (const auto& parameter : declaration.parameters) {
+        if (!names.insert(parameter.name).second) throw std::runtime_error("Duplicate parameter: " + parameter.name);
+        if (GetType(parameter.type)->isVoidTy()) throw std::runtime_error("Parameter cannot have void type");
     }
+    for (const auto& node : declaration.body) {
+        auto* capture = dynamic_cast<const CaptureDeclaration*>(node.get());
+        if (!capture) continue;
+        if (!local) throw std::runtime_error("capture requires a local function");
+        for (const auto& name : capture->names) {
+            if (!names.insert(name).second) throw std::runtime_error("Duplicate capture or parameter: " + name);
+            auto variable = variables.find(name);
+            if (variable == variables.end()) {
+                if (inaccessibleVariables.contains(name)) throw std::runtime_error("Variable requires capture in enclosing function: " + name);
+                throw std::runtime_error("Cannot capture undefined variable: " + name);
+            }
+            captures.push_back(Capture{name, variable->second});
+        }
+    }
+    for (const auto& node : declaration.body) {
+        if (auto* variable = dynamic_cast<const VariableDeclaration*>(node.get())) {
+            if (names.contains(variable->name)) throw std::runtime_error("Duplicate variable: " + variable->name);
+        }
+        if (auto* function = dynamic_cast<const FunctionDeclaration*>(node.get())) {
+            if (names.contains(function->name)) throw std::runtime_error("Duplicate declaration: " + function->name);
+        }
+    }
+    std::vector<llvm::Type*> parameterTypes(captures.size(), llvm::PointerType::getUnqual(Context));
+    for (const auto& parameter : declaration.parameters) parameterTypes.push_back(GetType(parameter.type));
+    auto* functionType = llvm::FunctionType::get(GetType(declaration.returnType), parameterTypes, false);
+    auto name = local ? "__c4r_local_" + std::to_string(nextFunctionId++) : declaration.name;
+    if (!local && Module.getNamedValue(name)) throw std::runtime_error("Duplicate function: " + name);
+    auto* function = llvm::Function::Create(functionType, local ? llvm::Function::InternalLinkage : llvm::Function::ExternalLinkage, name, Module);
+    return std::make_shared<FunctionSymbol>(FunctionSymbol{function, &declaration, std::move(captures)});
+}
 
-    auto* returnType = GetType(declaration.returnType);
-
-    auto* functionType = llvm::FunctionType::get(
-        returnType,
-        false
-    );
-
-    auto* function = llvm::Function::Create(
-        functionType,
-        llvm::Function::ExternalLinkage,
-        declaration.name,
-        Module
-    );
-
-    auto* entry = llvm::BasicBlock::Create(
-        Context,
-        "entry",
-        function
-    );
-
+void LLVM::EmitFunctionBody(const std::shared_ptr<FunctionSymbol>& symbol) {
+    auto savedInsert = Builder.saveIP();
+    auto outerVariables = variables;
+    auto outerBindings = bindings;
+    auto outerInaccessible = inaccessibleVariables;
+    auto outerCaptures = validCaptures;
+    auto outerValueScopes = valueScopes;
+    auto outerLoops = loops;
+    variables.clear(); bindings.clear(); valueScopes.clear(); loops.clear(); validCaptures.clear();
+    for (const auto& [name, variable] : outerVariables) inaccessibleVariables.insert(name);
+    const auto& declaration = *symbol->declaration;
+    for (const auto& node : declaration.body) {
+        if (auto* capture = dynamic_cast<const CaptureDeclaration*>(node.get())) validCaptures.insert(capture);
+    }
+    auto* entry = llvm::BasicBlock::Create(Context, "entry", symbol->function);
     Builder.SetInsertPoint(entry);
-
-    variables.clear();
+    auto argument = symbol->function->arg_begin();
+    for (const auto& capture : symbol->captures) {
+        Variable variable{&*argument++, capture.variable.type, capture.variable.isMutable, capture.variable.id};
+        variables.insert_or_assign(capture.name, variable);
+        bindings.insert_or_assign(variable.id, variable);
+        inaccessibleVariables.erase(capture.name);
+    }
+    for (const auto& parameter : declaration.parameters) {
+        auto* type = GetType(parameter.type);
+        auto* storage = Builder.CreateAlloca(type, nullptr, parameter.name);
+        Builder.CreateStore(&*argument++, storage);
+        Variable variable{storage, type, parameter.isMutable, nextVariableId++};
+        variables.insert_or_assign(parameter.name, variable);
+        bindings.insert_or_assign(variable.id, variable);
+        inaccessibleVariables.erase(parameter.name);
+    }
+    for (const auto& node : declaration.body) {
+        if (auto* variable = dynamic_cast<const VariableDeclaration*>(node.get())) {
+            for (const auto& parameter : declaration.parameters)
+                if (parameter.name == variable->name) throw std::runtime_error("Duplicate variable: " + variable->name);
+        }
+    }
     EmitBody(declaration.body);
-
-    if (Builder.GetInsertBlock()->hasTerminator()) {
-        return;
+    if (!Builder.GetInsertBlock()->hasTerminator()) {
+        auto* returnType = symbol->function->getReturnType();
+        if (returnType->isVoidTy()) Builder.CreateRetVoid();
+        else if (symbol->function->hasExternalLinkage() && (declaration.name == "main" || declaration.name == "start" || declaration.name == "entry") && declaration.parameters.empty() && returnType->isIntegerTy(32)) Builder.CreateRet(Builder.getInt32(0));
+        else throw std::runtime_error("Function must return a value: " + declaration.name);
     }
-    if (returnType->isVoidTy()) {
-        Builder.CreateRetVoid();
-    }
-    else if (returnType->isIntegerTy(32)) {
-        Builder.CreateRet(Builder.getInt32(0));
-    }
-    else {
-        throw std::runtime_error(
-            "Unsupported return type"
-        );
-    }
+    variables = std::move(outerVariables);
+    bindings = std::move(outerBindings);
+    inaccessibleVariables = std::move(outerInaccessible);
+    validCaptures = std::move(outerCaptures);
+    valueScopes = std::move(outerValueScopes);
+    loops = std::move(outerLoops);
+    Builder.restoreIP(savedInsert);
 }
 
 void LLVM::EmitImplicitMain(const Program& program) {
@@ -567,17 +669,16 @@ void LLVM::EmitImplicitMain(const Program& program) {
 }
 
 void LLVM::Generate(const Program& program) {
-    bool hasMain = false;
-    bool hasTopLevelString = false;
+    bool hasTopLevelStatements = false;
 
     for (const auto& node : program.children) {
         if (auto* function = dynamic_cast<FunctionDeclaration*>(node.get())) {
-            if (function->name == "main") {
-                hasMain = true;
-            }
+            if (functions.contains(function->name)) throw std::runtime_error("Duplicate function: " + function->name);
+            if (function->name == "printf") throw std::runtime_error("Reserved function name: printf");
+            functions[function->name] = DeclareFunction(*function, false);
         }
         else if (!dynamic_cast<FunctionDeclaration*>(node.get())) {
-            hasTopLevelString = true;
+            hasTopLevelStatements = true;
         }
         else {
             throw std::runtime_error(
@@ -586,20 +687,38 @@ void LLVM::Generate(const Program& program) {
         }
     }
 
-    if (hasMain && hasTopLevelString) {
+    std::string entryName;
+    if (functions.contains("main")) {
+        const auto& main = *functions.at("main")->declaration;
+        if (!main.parameters.empty() || !GetType(main.returnType)->isIntegerTy(32)) throw std::runtime_error("main must return int and have no parameters");
+        entryName = "main";
+    } else {
+        for (const auto* name : {"start", "entry"}) {
+            auto it = functions.find(name);
+            if (it != functions.end() && it->second->declaration->parameters.empty() && GetType(it->second->declaration->returnType)->isIntegerTy(32)) {
+                entryName = name; break;
+            }
+        }
+    }
+    if (!entryName.empty() && hasTopLevelStatements) {
         throw std::runtime_error(
-            "Top-level strings with explicit main are not supported yet"
+            "Top-level statements with explicit entry point are not supported yet"
         );
     }
 
     for (const auto& node : program.children) {
         if (auto* function = dynamic_cast<FunctionDeclaration*>(node.get())) {
-            EmitFunction(*function);
+            EmitFunctionBody(functions.at(function->name));
         }
     }
 
-    if (!hasMain) {
+    if (entryName.empty()) {
         EmitImplicitMain(program);
+    } else if (entryName != "main") {
+        auto* type = llvm::FunctionType::get(Builder.getInt32Ty(), false);
+        auto* wrapper = llvm::Function::Create(type, llvm::Function::ExternalLinkage, "main", Module);
+        Builder.SetInsertPoint(llvm::BasicBlock::Create(Context, "entry", wrapper));
+        Builder.CreateRet(Builder.CreateCall(functions.at(entryName)->function));
     }
 
     if (llvm::verifyModule(Module, &llvm::errs())) {
