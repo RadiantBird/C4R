@@ -54,6 +54,22 @@ struct VariableDeclaration : ASTNode {
     bool isMutable = false;
     bool isConst = false;
     std::unique_ptr<Expression> initialValue;
+    bool aggregateInit = false;
+};
+
+struct TypeDeclaration : ASTNode {
+    struct Member {
+        bool isPublic;
+        std::unique_ptr<ASTNode> declaration;
+    };
+    std::string name;
+    bool isStruct = false;
+    std::vector<Member> members;
+};
+
+struct MemberExpr : Expression {
+    std::unique_ptr<Expression> object;
+    std::string name;
 };
 
 struct IdentifierExpr : Expression {
@@ -62,6 +78,7 @@ struct IdentifierExpr : Expression {
 
 struct CallExpr : Expression {
     std::string name;
+    std::unique_ptr<Expression> object;
     std::vector<std::unique_ptr<Expression>> arguments;
 };
 

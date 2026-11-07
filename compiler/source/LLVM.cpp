@@ -35,6 +35,8 @@ llvm::Type* LLVM::GetType(const std::string& name) {
         return Builder.getInt32Ty();
     }
     if (name == "bool") return Builder.getInt1Ty();
+    if (name == "float") return Builder.getFloatTy();
+    if (types.contains(name)) return types.at(name).type;
 
     throw std::runtime_error(
         "Unknown type: " + name
@@ -89,18 +91,59 @@ void LLVM::EmitString(const StringStatement& statement) {
     );
 }
 
-LLVM::Variable& LLVM::MutableVariable(const Expression& expression) {
+LLVM::Variable LLVM::ResolveLValue(const Expression& expression) {
     auto* identifier = dynamic_cast<const IdentifierExpr*>(&expression);
-    if (!identifier) throw std::runtime_error("Assignment requires a variable");
-    auto it = variables.find(identifier->name);
-    if (it == variables.end()) throw std::runtime_error("Undefined variable: " + identifier->name);
-    if (!it->second.isMutable) throw std::runtime_error("Cannot modify immutable variable: " + identifier->name);
-    return it->second;
+    if (identifier) {
+        auto it = variables.find(identifier->name);
+        if (it != variables.end()) return it->second;
+        if (currentMethod && types.at(currentMethod->owner).fields.contains(identifier->name)) {
+            MemberExpr member;
+            auto self = std::make_unique<IdentifierExpr>(); self->name = "$self";
+            member.object = std::move(self); member.name = identifier->name;
+            return ResolveLValue(member);
+        }
+        throw std::runtime_error("Undefined variable: " + identifier->name);
+    }
+    auto* member = dynamic_cast<const MemberExpr*>(&expression);
+    if (!member) throw std::runtime_error("Assignment requires a variable");
+    auto object = ResolveLValue(*member->object);
+    for (auto& [name, type] : types) {
+        if (type.type != object.type) continue;
+        auto field = type.fields.find(member->name);
+        if (field == type.fields.end()) throw std::runtime_error("Unknown field: " + member->name);
+        if (!field->second.isPublic && (!currentMethod || currentMethod->owner != name))
+            throw std::runtime_error("Private member: " + member->name);
+        auto* fieldType = GetType(field->second.declaration->type);
+        return {Builder.CreateStructGEP(type.type, object.storage, field->second.index), fieldType,
+                object.isMutable && field->second.declaration->isMutable, 0, object.isReceiver};
+    }
+    throw std::runtime_error("Member access requires a user-defined type");
+}
+
+LLVM::Variable LLVM::MutableVariable(const Expression& expression) {
+    auto variable = ResolveLValue(expression);
+    if (!variable.isMutable) throw std::runtime_error("Cannot modify immutable variable or field");
+    if (variable.isReceiver && currentMethod) currentMethod->mutates = true;
+    return variable;
 }
 
 llvm::Value* LLVM::EmitBinary(const std::string& op, llvm::Value* left, llvm::Value* right) {
     if (left->getType()->isVoidTy() || right->getType()->isVoidTy()) throw std::runtime_error("Void expression cannot be used as an operand");
     if (left->getType() != right->getType()) throw std::runtime_error("Operand types do not match for " + op);
+    if (left->getType()->isFloatTy()) {
+        if (op == "+") return Builder.CreateFAdd(left, right);
+        if (op == "-") return Builder.CreateFSub(left, right);
+        if (op == "*") return Builder.CreateFMul(left, right);
+        if (op == "/") return Builder.CreateFDiv(left, right);
+        if (op == "==") return Builder.CreateFCmpOEQ(left, right);
+        if (op == "!=") return Builder.CreateFCmpUNE(left, right);
+        if (op == "<") return Builder.CreateFCmpOLT(left, right);
+        if (op == "<=") return Builder.CreateFCmpOLE(left, right);
+        if (op == ">") return Builder.CreateFCmpOGT(left, right);
+        if (op == ">=") return Builder.CreateFCmpOGE(left, right);
+        throw std::runtime_error("Unsupported float operator: " + op);
+    }
+    if (!left->getType()->isIntegerTy()) throw std::runtime_error("Unsupported operand type for " + op);
     if (op == "==") return Builder.CreateICmpEQ(left, right);
     if (op == "!=") return Builder.CreateICmpNE(left, right);
     if (op == "^^") {
@@ -164,12 +207,17 @@ llvm::Value* LLVM::EmitCondition(const Expression& expression) {
 void LLVM::EmitVariable(const VariableDeclaration& declaration) {
     auto* type = GetType(declaration.type);
     if (type->isVoidTy()) throw std::runtime_error("Variable cannot have void type");
-    auto* value = EmitExpression(*declaration.initialValue);
-    if (value->getType() != type) throw std::runtime_error("Initializer type mismatch: " + declaration.name);
     auto& entry = Builder.GetInsertBlock()->getParent()->getEntryBlock();
     llvm::IRBuilder<> entryBuilder(&entry, entry.begin());
     auto* storage = entryBuilder.CreateAlloca(type, nullptr, declaration.name);
-    Builder.CreateStore(value, storage);
+    if (declaration.aggregateInit) {
+        if (!types.contains(declaration.type)) throw std::runtime_error("Brace initialization requires a user-defined type");
+        InitializeObject(storage, types.at(declaration.type));
+    } else {
+        auto* value = EmitExpression(*declaration.initialValue);
+        if (value->getType() != type) throw std::runtime_error("Initializer type mismatch: " + declaration.name);
+        Builder.CreateStore(value, storage);
+    }
     Variable variable{storage, type, declaration.isMutable, nextVariableId++};
     variables.insert_or_assign(declaration.name, variable);
     bindings.insert_or_assign(variable.id, variable);
@@ -197,6 +245,59 @@ llvm::Value* LLVM::EmitCall(const std::string& name, const std::vector<std::uniq
     return Builder.CreateCall(symbol->function, values);
 }
 
+void LLVM::InitializeObject(llvm::Value* storage, TypeInfo& type) {
+    for (const auto& member : type.declaration->members) {
+        auto* field = dynamic_cast<const VariableDeclaration*>(member.declaration.get());
+        if (!field) continue;
+        auto& info = type.fields.at(field->name);
+        auto* address = Builder.CreateStructGEP(type.type, storage, info.index);
+        auto* fieldType = GetType(field->type);
+        if (field->initialValue) {
+            auto savedVariables = variables;
+            auto savedBindings = bindings;
+            auto savedFunctions = functions;
+            auto savedMethod = currentMethod;
+            variables.clear(); bindings.clear(); currentMethod.reset();
+            for (auto it = functions.begin(); it != functions.end();) {
+                if (!it->second->function->hasExternalLinkage()) it = functions.erase(it);
+                else ++it;
+            }
+            auto* value = EmitExpression(*field->initialValue);
+            variables = std::move(savedVariables);
+            bindings = std::move(savedBindings);
+            functions = std::move(savedFunctions);
+            currentMethod = std::move(savedMethod);
+            if (value->getType() != fieldType) throw std::runtime_error("Initializer type mismatch: " + field->name);
+            Builder.CreateStore(value, address);
+        } else if (types.contains(field->type)) InitializeObject(address, types.at(field->type));
+        else Builder.CreateStore(llvm::Constant::getNullValue(fieldType), address);
+    }
+}
+
+llvm::Value* LLVM::EmitMethodCall(const CallExpr& call) {
+    Variable object;
+    if (call.object) object = ResolveLValue(*call.object);
+    else object = variables.at("$self");
+    for (auto& [name, type] : types) {
+        if (type.type != object.type) continue;
+        auto found = type.methods.find(call.name);
+        if (found == type.methods.end()) throw std::runtime_error("Unknown method: " + call.name);
+        auto symbol = found->second.first;
+        if (!found->second.second && (!currentMethod || currentMethod->owner != name)) throw std::runtime_error("Private member: " + call.name);
+        if (call.arguments.size() != symbol->declaration->parameters.size()) throw std::runtime_error("Wrong number of arguments for method: " + call.name);
+        if (!object.isMutable) immutableCalls.push_back(symbol);
+        else if (object.isReceiver && currentMethod) currentMethod->calls.push_back(symbol);
+        std::vector<llvm::Value*> args{object.storage};
+        for (size_t i = 0; i < call.arguments.size(); ++i) {
+            auto* value = EmitExpression(*call.arguments[i]);
+            if (value->getType() != GetType(symbol->declaration->parameters[i].type)) throw std::runtime_error("Argument type mismatch for method: " + call.name);
+            args.push_back(value);
+        }
+        return Builder.CreateCall(symbol->function, args);
+    }
+    throw std::runtime_error("Method call requires a user-defined type");
+}
+
 llvm::Value* LLVM::FinishValueScope(ValueScope& scope) {
     if (scope.returns.empty()) throw std::runtime_error("Value scope requires return");
     Builder.SetInsertPoint(scope.exit);
@@ -217,7 +318,23 @@ llvm::Value* LLVM::EmitValueBlock(const Block& block) {
 
 llvm::Value* LLVM::EmitExpression(const Expression& expression) {
     diagnosticOffset = expression.offset;
-    if (auto* call = dynamic_cast<const CallExpr*>(&expression)) return EmitCall(call->name, call->arguments);
+    if (auto* call = dynamic_cast<const CallExpr*>(&expression)) {
+        if (call->object || (currentMethod && types.at(currentMethod->owner).methods.contains(call->name) && !functions.contains(call->name) && !variables.contains(call->name))) return EmitMethodCall(*call);
+        return EmitCall(call->name, call->arguments);
+    }
+    if (auto* member = dynamic_cast<const MemberExpr*>(&expression)) {
+        auto object = ResolveLValue(*member->object);
+        for (auto& [name, type] : types) if (type.type == object.type && type.methods.contains(member->name)) {
+            auto symbol = type.methods.at(member->name).first;
+            if (!type.methods.at(member->name).second && (!currentMethod || currentMethod->owner != name)) throw std::runtime_error("Private member: " + member->name);
+            if (!symbol->declaration->parameters.empty()) throw std::runtime_error("Wrong number of arguments for method: " + member->name);
+            if (!object.isMutable) immutableCalls.push_back(symbol);
+            else if (object.isReceiver && currentMethod) currentMethod->calls.push_back(symbol);
+            return Builder.CreateCall(symbol->function, {object.storage});
+        }
+        auto field = ResolveLValue(expression);
+        return Builder.CreateLoad(field.type, field.storage);
+    }
     if (auto* block = dynamic_cast<const BlockExpr*>(&expression)) return EmitValueBlock(*block->block);
     if (auto* branch = dynamic_cast<const IfExpr*>(&expression)) {
         auto* condition = EmitCondition(*branch->condition);
@@ -237,12 +354,22 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
         return FinishValueScope(scope);
     }
     if (auto* literal = dynamic_cast<const NumericLiteral*>(&expression)) {
+        if (literal->value.find('.') != std::string::npos)
+            return llvm::ConstantFP::get(Builder.getFloatTy(), std::stod(literal->value));
         auto value = std::stoll(literal->value);
         if (value > INT32_MAX) throw std::runtime_error("Integer literal out of range");
         return Builder.getInt32(static_cast<int32_t>(value));
     }
     if (auto* literal = dynamic_cast<const BooleanLiteral*>(&expression)) return Builder.getInt1(literal->value);
     if (auto* identifier = dynamic_cast<const IdentifierExpr*>(&expression)) {
+        if (!variables.contains(identifier->name) && currentMethod && types.at(currentMethod->owner).fields.contains(identifier->name)) {
+            auto field = ResolveLValue(expression);
+            return Builder.CreateLoad(field.type, field.storage);
+        }
+        if (!variables.contains(identifier->name) && !functions.contains(identifier->name) && currentMethod && types.at(currentMethod->owner).methods.contains(identifier->name)) {
+            CallExpr call; call.name = identifier->name;
+            return EmitMethodCall(call);
+        }
         auto it = variables.find(identifier->name);
         if (it == variables.end()) {
             if (inaccessibleVariables.contains(identifier->name)) throw std::runtime_error("Variable requires capture: " + identifier->name);
@@ -256,7 +383,7 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
     }
     if (auto* unary = dynamic_cast<const UnaryExpr*>(&expression)) {
         if (unary->op == "++" || unary->op == "--") {
-            auto& var = MutableVariable(*unary->operand);
+            auto var = MutableVariable(*unary->operand);
             if (!var.type->isIntegerTy(32)) throw std::runtime_error("Increment requires int32");
             auto* old = Builder.CreateLoad(var.type, var.storage);
             auto* value = unary->op == "++" ? Builder.CreateAdd(old, Builder.getInt32(1)) : Builder.CreateSub(old, Builder.getInt32(1));
@@ -264,6 +391,8 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
             return unary->postfix ? old : value;
         }
         auto* value = EmitExpression(*unary->operand);
+        if (value->getType()->isFloatTy() && (unary->op == "+" || unary->op == "-"))
+            return unary->op == "+" ? value : Builder.CreateFNeg(value);
         if (unary->op == "!") {
             if (!value->getType()->isIntegerTy(1)) throw std::runtime_error("Logical NOT requires bool");
             return Builder.CreateNot(value);
@@ -299,6 +428,7 @@ llvm::Value* LLVM::EmitExpression(const Expression& expression) {
         const auto& op = binary->op;
         if (op == "=" || op == "+=" || op == "-=" || op == "*=" || op == "/=" || op == "%=" || op == "&=" || op == "|=" || op == "^=" || op == "<<=" || op == ">>=") {
             auto var = MutableVariable(*binary->left);
+            if (var.type->isStructTy()) throw std::runtime_error("Assignment to a user-defined value is not supported");
             auto* old = op == "=" ? nullptr : Builder.CreateLoad(var.type, var.storage);
             auto* value = EmitExpression(*binary->right);
             if (value->getType() != var.type) throw std::runtime_error("Assignment type mismatch");
@@ -360,6 +490,8 @@ void LLVM::EmitBody(
 
     for (const auto& node : body) {
         diagnosticOffset = node->offset;
+
+        if (dynamic_cast<TypeDeclaration*>(node.get())) continue;
 
         if (auto* declaration = dynamic_cast<FunctionDeclaration*>(node.get())) {
             auto existing = functions.find(declaration->name);
@@ -509,10 +641,14 @@ void LLVM::EmitBody(
                         );
                     }
 
-                    format += "%d";
-
                     llvm::Value* value = Builder.CreateLoad(it->second.type, it->second.storage, identifier->name + ".value");
-                    if (it->second.type->isIntegerTy(1)) value = Builder.CreateZExt(value, Builder.getInt32Ty());
+                    if (it->second.type->isFloatTy()) {
+                        format += "%g";
+                        value = Builder.CreateFPExt(value, Builder.getDoubleTy());
+                    } else if (it->second.type->isIntegerTy(32) || it->second.type->isIntegerTy(1)) {
+                        format += "%d";
+                        if (it->second.type->isIntegerTy(1)) value = Builder.CreateZExt(value, Builder.getInt32Ty());
+                    } else throw std::runtime_error("Unsupported format string type: " + identifier->name);
                     arguments.push_back(value);
                 }
 
@@ -595,6 +731,8 @@ void LLVM::EmitFunctionBody(const std::shared_ptr<FunctionSymbol>& symbol) {
     auto outerCaptures = validCaptures;
     auto outerValueScopes = valueScopes;
     auto outerLoops = loops;
+    auto outerMethod = currentMethod;
+    currentMethod = symbol->owner.empty() ? nullptr : symbol;
     variables.clear(); bindings.clear(); valueScopes.clear(); loops.clear(); validCaptures.clear();
     for (const auto& [name, variable] : outerVariables) inaccessibleVariables.insert(name);
     const auto& declaration = *symbol->declaration;
@@ -604,6 +742,11 @@ void LLVM::EmitFunctionBody(const std::shared_ptr<FunctionSymbol>& symbol) {
     auto* entry = llvm::BasicBlock::Create(Context, "entry", symbol->function);
     Builder.SetInsertPoint(entry);
     auto argument = symbol->function->arg_begin();
+    if (currentMethod) {
+        Variable self{&*argument++, types.at(symbol->owner).type, true, nextVariableId++, true};
+        variables.insert_or_assign("$self", self);
+        bindings.insert_or_assign(self.id, self);
+    }
     for (const auto& capture : symbol->captures) {
         Variable variable{&*argument++, capture.variable.type, capture.variable.isMutable, capture.variable.id};
         variables.insert_or_assign(capture.name, variable);
@@ -638,6 +781,7 @@ void LLVM::EmitFunctionBody(const std::shared_ptr<FunctionSymbol>& symbol) {
     validCaptures = std::move(outerCaptures);
     valueScopes = std::move(outerValueScopes);
     loops = std::move(outerLoops);
+    currentMethod = std::move(outerMethod);
     Builder.restoreIP(savedInsert);
 }
 
@@ -672,12 +816,56 @@ void LLVM::Generate(const Program& program) {
     bool hasTopLevelStatements = false;
 
     for (const auto& node : program.children) {
+        auto* declaration = dynamic_cast<const TypeDeclaration*>(node.get());
+        if (!declaration) continue;
+        if (types.contains(declaration->name)) throw std::runtime_error("Duplicate type: " + declaration->name);
+        types.emplace(declaration->name, TypeInfo{declaration, llvm::StructType::create(Context, declaration->name), {}, {}});
+    }
+    for (const auto& node : program.children) {
+        auto* declaration = dynamic_cast<const TypeDeclaration*>(node.get());
+        if (!declaration) continue;
+        auto& type = types.at(declaration->name);
+        std::vector<llvm::Type*> fields;
+        std::unordered_set<std::string> names;
+        for (const auto& member : declaration->members) {
+            if (auto* field = dynamic_cast<const VariableDeclaration*>(member.declaration.get())) {
+                if (!names.insert(field->name).second) throw std::runtime_error("Duplicate member: " + field->name);
+                auto* fieldType = GetType(field->type);
+                if (fieldType->isVoidTy() || (fieldType->isStructTy() && !fieldType->isSized())) throw std::runtime_error("Invalid or incomplete field type: " + field->type);
+                type.fields.emplace(field->name, FieldInfo{field, member.isPublic, static_cast<unsigned>(fields.size())});
+                fields.push_back(fieldType);
+            } else if (auto* method = dynamic_cast<const FunctionDeclaration*>(member.declaration.get())) {
+                if (!names.insert(method->name).second) throw std::runtime_error("Duplicate member: " + method->name);
+            }
+        }
+        type.type->setBody(fields);
+        for (const auto& member : declaration->members) {
+            auto* method = dynamic_cast<const FunctionDeclaration*>(member.declaration.get());
+            if (!method) continue;
+            std::vector<llvm::Type*> args{llvm::PointerType::getUnqual(Context)};
+            std::unordered_set<std::string> parameters;
+            for (const auto& parameter : method->parameters) {
+                if (!parameters.insert(parameter.name).second) throw std::runtime_error("Duplicate parameter: " + parameter.name);
+                auto* parameterType = GetType(parameter.type);
+                if (parameterType->isVoidTy()) throw std::runtime_error("Parameter cannot have void type");
+                args.push_back(parameterType);
+            }
+            auto* signature = llvm::FunctionType::get(GetType(method->returnType), args, false);
+            auto* function = llvm::Function::Create(signature, llvm::Function::InternalLinkage, "__c4r_method_" + std::to_string(nextFunctionId++), Module);
+            auto symbol = std::make_shared<FunctionSymbol>(FunctionSymbol{function, method, {}, declaration->name});
+            type.methods.emplace(method->name, std::make_pair(symbol, member.isPublic));
+        }
+    }
+
+    for (const auto& node : program.children) {
         if (auto* function = dynamic_cast<FunctionDeclaration*>(node.get())) {
             if (functions.contains(function->name)) throw std::runtime_error("Duplicate function: " + function->name);
             if (function->name == "printf") throw std::runtime_error("Reserved function name: printf");
             functions[function->name] = DeclareFunction(*function, false);
         }
-        else if (!dynamic_cast<FunctionDeclaration*>(node.get())) {
+        else if (dynamic_cast<TypeDeclaration*>(node.get())) {
+            continue;
+        } else if (!dynamic_cast<FunctionDeclaration*>(node.get())) {
             hasTopLevelStatements = true;
         }
         else {
@@ -712,6 +900,9 @@ void LLVM::Generate(const Program& program) {
         }
     }
 
+    for (auto& [name, type] : types)
+        for (auto& [methodName, method] : type.methods) EmitFunctionBody(method.first);
+
     if (entryName.empty()) {
         EmitImplicitMain(program);
     } else if (entryName != "main") {
@@ -721,6 +912,15 @@ void LLVM::Generate(const Program& program) {
         Builder.CreateRet(Builder.CreateCall(functions.at(entryName)->function));
     }
 
+    bool changed;
+    do {
+        changed = false;
+        for (auto& [name, type] : types) for (auto& [methodName, entry] : type.methods) {
+            auto& method = entry.first;
+            if (!method->mutates) for (const auto& callee : method->calls) if (callee->mutates) { method->mutates = true; changed = true; break; }
+        }
+    } while (changed);
+    for (const auto& method : immutableCalls) if (method->mutates) throw std::runtime_error("Cannot call mutating method on immutable instance: " + method->declaration->name);
     if (llvm::verifyModule(Module, &llvm::errs())) {
         throw std::runtime_error(
             "LLVM IR verification failed"

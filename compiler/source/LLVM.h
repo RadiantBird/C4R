@@ -30,7 +30,7 @@ private:
     llvm::Module Module;
     llvm::IRBuilder<> Builder;
     size_t diagnosticOffset = 0;
-    struct Variable { llvm::Value* storage; llvm::Type* type; bool isMutable; size_t id; };
+    struct Variable { llvm::Value* storage; llvm::Type* type; bool isMutable; size_t id; bool isReceiver = false; };
     std::unordered_map<std::string, Variable> variables;
     std::unordered_map<size_t, Variable> bindings;
     size_t nextVariableId = 0;
@@ -40,7 +40,23 @@ private:
         llvm::Function* function;
         const FunctionDeclaration* declaration;
         std::vector<Capture> captures;
+        std::string owner;
+        bool mutates = false;
+        std::vector<std::shared_ptr<FunctionSymbol>> calls;
     };
+    struct FieldInfo { const VariableDeclaration* declaration; bool isPublic; unsigned index; };
+    struct TypeInfo {
+        const TypeDeclaration* declaration;
+        llvm::StructType* type;
+        std::unordered_map<std::string, FieldInfo> fields;
+        std::unordered_map<std::string, std::pair<std::shared_ptr<FunctionSymbol>, bool>> methods;
+    };
+    std::unordered_map<std::string, TypeInfo> types;
+    std::shared_ptr<FunctionSymbol> currentMethod;
+    std::vector<std::shared_ptr<FunctionSymbol>> immutableCalls;
+    Variable ResolveLValue(const Expression& expression);
+    llvm::Value* EmitMethodCall(const CallExpr& call);
+    void InitializeObject(llvm::Value* storage, TypeInfo& type);
     std::unordered_map<std::string, std::shared_ptr<FunctionSymbol>> functions;
     std::unordered_set<std::string> inaccessibleVariables;
     std::unordered_set<const CaptureDeclaration*> validCaptures;
@@ -55,7 +71,7 @@ private:
 
     llvm::Value* EmitExpression(const Expression& expression);
     llvm::Value* EmitBinary(const std::string& op, llvm::Value* left, llvm::Value* right);
-    Variable& MutableVariable(const Expression& expression);
+    Variable MutableVariable(const Expression& expression);
     void EmitVariable(const VariableDeclaration& declaration);
     llvm::Value* EmitValueBlock(const Block& block);
     llvm::Value* FinishValueScope(ValueScope& scope);

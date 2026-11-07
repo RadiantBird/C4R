@@ -28,6 +28,9 @@ Test-Program shortcircuit 'int32 main() { int32 mutable x = 0; bool a = false &&
 Test-Program chain 'int32 main() { int32 mutable x = 0; bool a = 0 < ++x < 3; return x; }' 1
 Test-Program mixed_chain 'int32 main() { bool a = 1 < 2 == 2; bool b = 2 == 2 < 3; f"{a}{b}\n"; return 0; }' 0 '11'
 Test-Program implicit_main 'int32 mutable x = 2; x *= 3; f"{x}\n";' 0 '6'
+Test-Program float_arithmetic 'int main() { float mutable x = 1.5; x += 2.0; float y = -x * 2.0 / 7.0; if (y == -1.0 && x > 3.0) { return 0; } return 1; }' 0
+Test-Program float_format 'int main() { float x = 1.5; f"{x}\n"; return 0; }' 0 '1.5'
+Test-Rejected float_mixed 'int main() { float x = 1.0 + 1; return 0; }' 'Operand types do not match'
 Test-Rejected immutable 'int32 main() { int32 x = 1; x += 2; return x; }' 'Cannot modify immutable'
 Test-Rejected lvalue 'int32 main() { return ++(1 + 2); }' 'Assignment requires a variable'
 Test-Rejected types 'int32 main() { bool x = true + false; return 0; }' 'requires int32'

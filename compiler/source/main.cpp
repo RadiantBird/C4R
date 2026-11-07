@@ -33,6 +33,7 @@ enum class TokenType {
 
     Comma,
     Dot,
+    Colon,
     Operator,
 };
 
@@ -48,6 +49,7 @@ unordered_map<string, bool> StandardType = {
     {"int32", true},
     {"int", true},
     {"bool", true},
+    {"float", true},
     {"void", true},
 };
 
@@ -64,6 +66,7 @@ unordered_map<string, bool> ReservedWord = {
 
     {"const", true},
     {"mutable", true},    
+    {"struct", true}, {"class", true}, {"public", true}, {"private", true},
 };
 
 std::string tokenTypeToString(TokenType type) {
@@ -231,6 +234,12 @@ int main(int argc, char** argv) {
                     string number(1, c);
                     while (position < source.size() && std::isdigit(static_cast<unsigned char>(source[position])))
                         number += source[position++];
+                    if (position + 1 < source.size() && source[position] == '.' &&
+                        std::isdigit(static_cast<unsigned char>(source[position + 1]))) {
+                        number += source[position++];
+                        while (position < source.size() && std::isdigit(static_cast<unsigned char>(source[position])))
+                            number += source[position++];
+                    }
                     return {TokenType::Number, number};
                 }
                 if (string("+-*/%`!~<>=&|^").find(c) != string::npos) {
@@ -254,6 +263,8 @@ int main(int argc, char** argv) {
 
                 case '.':
                     return { TokenType::Dot, "." };
+                case ':':
+                    return { TokenType::Colon, ":" };
 
                 case '(':
                     return { TokenType::LeftParen, "(" };
@@ -413,11 +424,24 @@ int main(int argc, char** argv) {
             }
             left->offset = expressionOffset;
             while (true) {
+                if (currentToken.type == TokenType::Dot && minPrecedence <= PostfixPrecedence) {
+                    Advance();
+                    Expect(TokenType::Identifier);
+                    auto member = std::make_unique<MemberExpr>();
+                    member->object = std::move(left);
+                    member->name = currentToken.value;
+                    member->offset = expressionOffset;
+                    Advance();
+                    left = std::move(member);
+                    continue;
+                }
                 if (currentToken.type == TokenType::LeftParen && minPrecedence <= PostfixPrecedence) {
                     auto* identifier = dynamic_cast<IdentifierExpr*>(left.get());
-                    if (!identifier) throw std::runtime_error("Function call requires a function name");
+                    auto* member = dynamic_cast<MemberExpr*>(left.get());
+                    if (!identifier && !member) throw std::runtime_error("Function call requires a function name");
                     auto call = std::make_unique<CallExpr>();
-                    call->name = identifier->name;
+                    if (identifier) call->name = identifier->name;
+                    else { call->name = member->name; call->object = std::move(member->object); }
                     Advance();
                     if (currentToken.type != TokenType::RightParen) {
                         do {
@@ -686,7 +710,7 @@ int main(int argc, char** argv) {
             );
         }
 
-        void ParseVariableDeclaration(vector<unique_ptr<ASTNode>>& destination) {
+        void ParseVariableDeclaration(vector<unique_ptr<ASTNode>>& destination, bool field = false) {
             VariableDeclaration variable;
             variable.offset = currentToken.offset;
 
@@ -714,10 +738,13 @@ int main(int argc, char** argv) {
             variable.name = currentToken.value;
             Advance();
 
-            Expect(TokenType::Assign);
-            Advance();
-
-            variable.initialValue = ParseExpression();
+            if (currentToken.type == TokenType::Assign) {
+                Advance();
+                variable.initialValue = ParseExpression();
+            } else if (currentToken.type == TokenType::LeftBrace && !field) {
+                Advance(); Expect(TokenType::RightBrace); Advance();
+                variable.aggregateInit = true;
+            } else if (!field) throw std::runtime_error("Variable requires an initializer");
 
             Expect(TokenType::EndOfStatement);
             Advance();
@@ -725,6 +752,37 @@ int main(int argc, char** argv) {
             destination.push_back(
                 std::make_unique<VariableDeclaration>(std::move(variable))
             );
+        }
+
+        void ParseTypeDeclaration() {
+            auto type = std::make_unique<TypeDeclaration>();
+            type->isStruct = currentToken.value == "struct";
+            type->offset = currentToken.offset;
+            Advance(); Expect(TokenType::Identifier);
+            type->name = currentToken.value;
+            if (StandardType.contains(type->name)) throw std::runtime_error("Duplicate type: " + type->name);
+            StandardType[type->name] = true;
+            Advance(); Expect(TokenType::LeftBrace); Advance();
+            bool access = type->isStruct;
+            while (currentToken.type != TokenType::RightBrace) {
+                if (currentToken.type == TokenType::EndOfFile) throw std::runtime_error("Unexpected EOF in type");
+                bool memberAccess = access;
+                if (currentToken.value == "public" || currentToken.value == "private") {
+                    memberAccess = currentToken.value == "public";
+                    Advance();
+                    if (currentToken.type == TokenType::Colon) { access = memberAccess; Advance(); continue; }
+                }
+                vector<unique_ptr<ASTNode>> member;
+                Lexer lookahead = lexer;
+                Token name = lookahead.NextToken();
+                if (name.value == "mutable") name = lookahead.NextToken();
+                if (currentToken.type == TokenType::TypeName && name.type == TokenType::Identifier && lookahead.NextToken().type == TokenType::LeftParen)
+                    ParseFunctionStatement(member);
+                else ParseVariableDeclaration(member, true);
+                type->members.push_back({memberAccess, std::move(member.front())});
+            }
+            Advance(); Expect(TokenType::EndOfStatement); Advance();
+            program.children.push_back(std::move(type));
         }
 
     public:
@@ -737,7 +795,9 @@ int main(int argc, char** argv) {
 
         void ParseProgram() {
             while (currentToken.type != TokenType::EndOfFile) {
-                if (currentToken.type == TokenType::String) {
+                if (currentToken.value == "struct" || currentToken.value == "class") {
+                    ParseTypeDeclaration();
+                } else if (currentToken.type == TokenType::String) {
                     ParseStringStatement(program.children);
                 }
                 else if (currentToken.type == TokenType::TypeName) {
