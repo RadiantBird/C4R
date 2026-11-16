@@ -71,7 +71,10 @@ int main() {
     auto* declared = declaration.get();
     body.push_back(std::move(declaration));
     auto branch = std::make_unique<IfStatement>();
-    branch->condition = std::make_unique<BooleanLiteral>();
+    // A runtime condition keeps both paths reachable in the ownership graph.
+    auto branchCondition = std::make_unique<IdentifierExpr>();
+    branchCondition->name = "condition";
+    branch->condition = std::move(branchCondition);
     branch->thenBranch = std::make_unique<Block>();
     auto branchMove = std::make_unique<MoveExpr>();
     auto branchId = std::make_unique<IdentifierExpr>();
@@ -96,7 +99,9 @@ int main() {
     loopBody.push_back(std::move(owned));
     auto loop = std::make_unique<LoopStatement>();
     loop->kind = LoopStatement::Kind::While;
-    loop->condition = std::make_unique<BooleanLiteral>();
+    auto loopCondition = std::make_unique<IdentifierExpr>();
+    loopCondition->name = "condition";
+    loop->condition = std::move(loopCondition);
     loop->body = std::make_unique<Block>();
     auto loopMove = std::make_unique<MoveExpr>();
     auto loopId = std::make_unique<IdentifierExpr>(); loopId->name = "owner";

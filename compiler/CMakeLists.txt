@@ -17,10 +17,37 @@ find_package(zstd CONFIG REQUIRED)
 
 find_package(LLVM REQUIRED CONFIG)
 
+set(C4R_SEMANTIC_SOURCES
+    source/ConstantExpression.cpp
+    source/Semantic.cpp
+    source/SemanticBodyChecker.cpp
+    source/SemanticBorrows.cpp
+    source/SemanticDeclaration.cpp
+    source/SemanticExpressions.cpp
+    source/SemanticStatements.cpp
+)
+
 add_executable(C4R
     source/main.cpp
+    source/Compilation.cpp
+    source/CompilerApplication.cpp
+    source/EditorSymbols.cpp
+    source/ExecutableWriter.cpp
+    source/IRCalls.cpp
+    source/IRConstantEmitter.cpp
+    source/IRExpressions.cpp
+    source/IRFunctionEmitter.cpp
+    source/IRModuleEmitter.cpp
+    source/IRObjects.cpp
+    source/IROperatorEmitter.cpp
+    source/IRStatements.cpp
+    source/Lexer.cpp
     source/LLVM.cpp
-    source/Semantic.cpp
+    source/Parser.cpp
+    source/ParserDeclaration.cpp
+    source/ParserExpression.cpp
+    source/ParserStatement.cpp
+    ${C4R_SEMANTIC_SOURCES}
 )
 set_target_properties(C4R PROPERTIES OUTPUT_NAME c4rc)
 target_compile_definitions(C4R PRIVATE C4R_VERSION="${C4R_COMPILER_VERSION}")
@@ -69,7 +96,7 @@ target_link_libraries(C4R PRIVATE
 
 add_executable(ownership_semantic_test EXCLUDE_FROM_ALL
     tests/ownership_semantic.cpp
-    source/Semantic.cpp
+    ${C4R_SEMANTIC_SOURCES}
 )
 target_include_directories(ownership_semantic_test PRIVATE source ${LLVM_INCLUDE_DIRS})
 target_link_libraries(ownership_semantic_test PRIVATE ${LLVM_LIBS})

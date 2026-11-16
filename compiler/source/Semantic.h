@@ -71,6 +71,10 @@ public:
     size_t DiagnosticOffset() const { return diagnosticOffset; }
     const std::string& DiagnosticFile() const { return diagnosticFile; }
 private:
+    friend class SemanticBodyChecker;
+    friend class SemanticDeclarationCollector;
+
+    static std::string CanonicalType(std::string type);
     mutable size_t diagnosticOffset = 0;
     mutable std::string diagnosticFile;
     std::string entryPoint;
