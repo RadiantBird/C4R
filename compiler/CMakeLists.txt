@@ -2,6 +2,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(C4R LANGUAGES CXX)
+set(C4R_COMPILER_VERSION "0.0.0-dev" CACHE STRING "C4R compiler version")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,7 +20,10 @@ find_package(LLVM REQUIRED CONFIG)
 add_executable(C4R
     source/main.cpp
     source/LLVM.cpp
+    source/Semantic.cpp
 )
+set_target_properties(C4R PROPERTIES OUTPUT_NAME c4rc)
+target_compile_definitions(C4R PRIVATE C4R_VERSION="${C4R_COMPILER_VERSION}")
 
 target_include_directories(C4R PRIVATE
     source
@@ -62,3 +66,10 @@ target_link_libraries(C4R PRIVATE
     ntdll
     ${LLVM_LIBS}
 )
+
+add_executable(ownership_semantic_test EXCLUDE_FROM_ALL
+    tests/ownership_semantic.cpp
+    source/Semantic.cpp
+)
+target_include_directories(ownership_semantic_test PRIVATE source ${LLVM_INCLUDE_DIRS})
+target_link_libraries(ownership_semantic_test PRIVATE ${LLVM_LIBS})

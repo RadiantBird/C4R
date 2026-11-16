@@ -1,5 +1,7 @@
 #include <iostream>
 #include <LLVM.h>
+#include "Semantic.h"
+#include "OwnershipChecker.h"
 #include <print>
 #include <fstream>
 #include <string>
@@ -7,6 +9,8 @@
 #include <vector>
 #include <memory>
 #include <filesystem>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/Support/FileSystem.h>
 #include <fcntl.h>
 #include <io.h>
 // #include <cstdlib>
@@ -34,6 +38,7 @@ enum class TokenType {
     Comma,
     Dot,
     Colon,
+    At,
     Operator,
 };
 
@@ -141,32 +146,100 @@ struct Token {
 
 constexpr int PostfixPrecedence = 17;
 
+// AST offsets are relative to their source file, so retain the file on every
+// nested declaration and expression as well as on top-level declarations.
+void AssignSourceFile(ASTNode& node, const string& filename) {
+    node.sourceFile = filename;
+    auto visit = [&](auto& child) { if (child) AssignSourceFile(*child, filename); };
+    auto visitList = [&](auto& children) { for (auto& child : children) visit(child); };
+    if (auto* program = dynamic_cast<Program*>(&node)) visitList(program->children);
+    else if (auto* type = dynamic_cast<TypeDeclaration*>(&node)) for (auto& member : type->members) visit(member.declaration);
+    else if (auto* function = dynamic_cast<FunctionDeclaration*>(&node)) {
+        for (auto& parameter : function->parameters) parameter.sourceFile = filename;
+        visitList(function->body);
+    }
+    else if (auto* block = dynamic_cast<Block*>(&node)) visitList(block->statements);
+    else if (auto* variable = dynamic_cast<VariableDeclaration*>(&node)) visit(variable->initialValue);
+    else if (auto* result = dynamic_cast<ReturnStatement*>(&node)) visit(result->value);
+    else if (auto* member = dynamic_cast<MemberExpr*>(&node)) visit(member->object);
+    else if (auto* call = dynamic_cast<CallExpr*>(&node)) { visit(call->object); visitList(call->arguments); }
+    else if (auto* construct = dynamic_cast<ConstructExpr*>(&node)) visitList(construct->arguments);
+    else if (auto* move = dynamic_cast<MoveExpr*>(&node)) visit(move->operand);
+    else if (auto* unary = dynamic_cast<UnaryExpr*>(&node)) visit(unary->operand);
+    else if (auto* binary = dynamic_cast<BinaryExpr*>(&node)) { visit(binary->left); visit(binary->right); }
+    else if (auto* comparison = dynamic_cast<ComparisonExpr*>(&node)) visitList(comparison->operands);
+    else if (auto* branch = dynamic_cast<IfExpr*>(&node)) { visit(branch->condition); visit(branch->thenBranch); visit(branch->elseBranch); }
+    else if (auto* statementBranch = dynamic_cast<IfStatement*>(&node)) { visit(statementBranch->condition); visit(statementBranch->thenBranch); visit(statementBranch->elseBranch); }
+    else if (auto* blockExpression = dynamic_cast<BlockExpr*>(&node)) visit(blockExpression->block);
+    else if (auto* loop = dynamic_cast<LoopStatement*>(&node)) { visit(loop->initializer); visit(loop->condition); visit(loop->step); visit(loop->body); }
+    else if (auto* format = dynamic_cast<FormatStringStatement*>(&node)) visitList(format->parts);
+}
+
+struct CommandLine {
+    std::vector<string> inputs;
+    string output;
+    bool help = false, version = false;
+};
+
+CommandLine ParseCommandLine(int argc, char** argv) {
+    CommandLine result;
+    for (int i = 1; i < argc;) {
+        string arg = argv[i++];
+        if (arg == "-h" || arg == "--help") result.help = true;
+        else if (arg == "-v" || arg == "--version") result.version = true;
+        else if (arg == "-i" || arg == "--input") {
+            size_t before = result.inputs.size();
+            while (i < argc && argv[i][0] != '-') {
+                if (argv[i][0] == '\0') throw std::runtime_error("Input option requires a non-empty file name");
+                result.inputs.emplace_back(argv[i++]);
+            }
+            if (result.inputs.size() == before) throw std::runtime_error("Input option requires at least one file");
+        } else if (arg == "-o" || arg == "--output") {
+            if (!result.output.empty()) throw std::runtime_error("Output option specified more than once");
+            if (i == argc || argv[i][0] == '-' || argv[i][0] == '\0') throw std::runtime_error("Output option requires a file");
+            result.output = argv[i++];
+        } else if (!arg.empty() && arg[0] != '-' && argc == 2) result.inputs.push_back(arg);
+        else throw std::runtime_error("Unknown argument: " + arg);
+    }
+    if (!result.help && !result.version && result.inputs.empty()) throw std::runtime_error("No input files specified");
+    return result;
+}
+
 int main(int argc, char** argv) {
     bool symbols = argc == 4 && string(argv[1]) == "--symbols";
     bool check = (argc == 3 && string(argv[1]) == "--check") || symbols;
-    if ((!check && argc != 2) || (argc == 2 && (string(argv[1]) == "--check" || string(argv[1]) == "--symbols"))) {
-        std::cerr << "Usage: C4R [--check] <source.c4r|-> | --symbols <byte-offset> -\n";
-        return 1;
+    CommandLine options;
+    if (!check) {
+        try { options = ParseCommandLine(argc, argv); }
+        catch (const std::exception& e) { std::cerr << "c4rc: " << e.what() << '\n'; return 1; }
+        if (options.help) {
+            std::cout << "Usage: c4rc -i <source...> [-i <source...>] [-o <output>]\n"
+                         "  -i, --input    Input source files (repeatable)\n"
+                         "  -o, --output   Output executable\n"
+                         "  -h, --help     Show this help\n"
+                         "  -v, --version  Show compiler version\n"
+                         "       --check <source|-> | --symbols <offset> -\n";
+            return 0;
+        }
+        if (options.version) { std::cout << "c4rc " << C4R_VERSION << '\n'; return 0; }
     }
     string source = "";
-    string target = argv[symbols ? 3 : check ? 2 : 1];
+    vector<string> sourceFiles;
+    string target = check ? argv[symbols ? 3 : 2] : options.inputs.front();
 
     {
         if (check && target == "-") {
             _setmode(_fileno(stdin), _O_BINARY);
             source.assign(std::istreambuf_iterator<char>(std::cin), std::istreambuf_iterator<char>());
         } else {
-        std::ifstream file(target, std::ios::binary);
-
-        if (!file) {
-            print("Failed to open source file\n");
-            return -1;
+        auto inputs = check ? vector<string>{target} : options.inputs;
+        for (const auto& input : inputs) {
+            std::ifstream file(input, std::ios::binary);
+            if (!file) { std::cerr << "Failed to open source file: " << input << '\n'; return 1; }
+            string contents{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+            sourceFiles.push_back(contents);
+            source += contents + '\n';
         }
-
-        source.assign(
-            std::istreambuf_iterator<char>(file),
-            std::istreambuf_iterator<char>()
-        );
         }
     }
 
@@ -265,6 +338,8 @@ int main(int argc, char** argv) {
                     return { TokenType::Dot, "." };
                 case ':':
                     return { TokenType::Colon, ":" };
+                case '@':
+                    return { TokenType::At, "@" };
 
                 case '(':
                     return { TokenType::LeftParen, "(" };
@@ -374,7 +449,7 @@ int main(int argc, char** argv) {
             const size_t expressionOffset = currentToken.offset;
             unique_ptr<Expression> left;
             if (currentToken.type == TokenType::Operator &&
-                (currentToken.value == "+" || currentToken.value == "-" || currentToken.value == "!" || currentToken.value == "~" || currentToken.value == "++" || currentToken.value == "--")) {
+                (currentToken.value == "+" || currentToken.value == "-" || currentToken.value == "!" || currentToken.value == "~" || currentToken.value == "&" || currentToken.value == "++" || currentToken.value == "--")) {
                 auto unary = std::make_unique<UnaryExpr>();
                 unary->op = currentToken.value;
                 Advance();
@@ -408,6 +483,19 @@ int main(int argc, char** argv) {
                 value->value = currentToken.value;
                 Advance();
                 left = std::move(value);
+            } else if (currentToken.type == TokenType::TypeName) {
+                auto value = std::make_unique<ConstructExpr>();
+                value->type = currentToken.value;
+                Advance(); Expect(TokenType::LeftParen); Advance();
+                if (currentToken.type != TokenType::RightParen) {
+                    do {
+                        value->arguments.push_back(ParseExpression());
+                        if (currentToken.type != TokenType::Comma) break;
+                        Advance();
+                    } while (true);
+                }
+                Expect(TokenType::RightParen); Advance();
+                left = std::move(value);
             } else if (currentToken.type == TokenType::Identifier) {
                 if (currentToken.value == "true" || currentToken.value == "false") {
                     auto value = std::make_unique<BooleanLiteral>();
@@ -439,6 +527,15 @@ int main(int argc, char** argv) {
                     auto* identifier = dynamic_cast<IdentifierExpr*>(left.get());
                     auto* member = dynamic_cast<MemberExpr*>(left.get());
                     if (!identifier && !member) throw std::runtime_error("Function call requires a function name");
+                    if (identifier && identifier->name == "move") {
+                        auto move = std::make_unique<MoveExpr>();
+                        move->offset = expressionOffset;
+                        Advance();
+                        move->operand = ParseExpression();
+                        Expect(TokenType::RightParen); Advance();
+                        left = std::move(move);
+                        continue;
+                    }
                     auto call = std::make_unique<CallExpr>();
                     if (identifier) call->name = identifier->name;
                     else { call->name = member->name; call->object = std::move(member->object); }
@@ -495,6 +592,7 @@ int main(int argc, char** argv) {
 
         void ParseStringStatement(vector<unique_ptr<ASTNode>>& destination) {
             Expect(TokenType::String);
+            size_t offset = currentToken.offset;
             string v = currentToken.value;
             Advance();
 
@@ -502,6 +600,7 @@ int main(int argc, char** argv) {
             Advance();
 
             StringStatement s;
+            s.offset = offset;
             s.value = v;
             destination.push_back(std::make_unique<StringStatement>(std::move(s)));
         }
@@ -511,6 +610,7 @@ int main(int argc, char** argv) {
 
             const string& source = currentToken.value;
             FormatStringStatement statement;
+            statement.offset = currentToken.offset;
 
             size_t position = 0;
 
@@ -573,8 +673,9 @@ int main(int argc, char** argv) {
         }
 
         std::unique_ptr<Block> ParseBlock() {
-            Expect(TokenType::LeftBrace); Advance();
             auto block = std::make_unique<Block>();
+            block->offset = currentToken.offset;
+            Expect(TokenType::LeftBrace); Advance();
             while (currentToken.type != TokenType::RightBrace) {
                 if (currentToken.type == TokenType::EndOfFile) throw std::runtime_error("Unexpected EOF in block");
                 ParseStatement(block->statements);
@@ -586,16 +687,33 @@ int main(int argc, char** argv) {
         void ParseStatement(vector<unique_ptr<ASTNode>>& destination) {
             if (currentToken.type == TokenType::String) { ParseStringStatement(destination); return; }
             if (currentToken.type == TokenType::FormatString) { ParseFormatStringStatement(destination); return; }
+            if (currentToken.type == TokenType::Identifier) {
+                Lexer lookahead = lexer;
+                Token next = lookahead.NextToken();
+                while (next.type == TokenType::Operator && next.value == "*") next = lookahead.NextToken();
+                if (next.value == "mutable") next = lookahead.NextToken();
+                if (next.type == TokenType::Identifier) throw std::runtime_error("Unknown type: " + currentToken.value);
+            }
             if (currentToken.type == TokenType::TypeName) {
                 Lexer lookahead = lexer;
                 Token name = lookahead.NextToken();
-                if (name.type == TokenType::Identifier && lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement(destination);
-                else ParseVariableDeclaration(destination);
-                return;
+                while (name.type == TokenType::Operator && name.value == "*") name = lookahead.NextToken();
+                if (name.value == "mutable") name = lookahead.NextToken();
+                if (name.type == TokenType::Operator && name.value == "&&") name = lookahead.NextToken();
+                if (name.type == TokenType::Operator && name.value == "&") {
+                    name = lookahead.NextToken();
+                    if (name.type == TokenType::At) { name = lookahead.NextToken(); name = lookahead.NextToken(); }
+                }
+                if (name.type != TokenType::LeftParen) {
+                    if (name.type == TokenType::Identifier && lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement(destination);
+                    else ParseVariableDeclaration(destination);
+                    return;
+                }
             }
             if (currentToken.value == "const") { ParseVariableDeclaration(destination); return; }
             if (currentToken.value == "capture") {
                 auto capture = std::make_unique<CaptureDeclaration>();
+                capture->offset = currentToken.offset;
                 Advance();
                 do {
                     Expect(TokenType::Identifier);
@@ -608,20 +726,24 @@ int main(int argc, char** argv) {
             }
             if (currentToken.type == TokenType::LeftBrace) { destination.push_back(ParseBlock()); return; }
             if (currentToken.value == "return") {
+                size_t offset = currentToken.offset;
                 Advance();
                 auto statement = std::make_unique<ReturnStatement>();
+                statement->offset = offset;
                 if (currentToken.type != TokenType::EndOfStatement) statement->value = ParseExpression();
                 Expect(TokenType::EndOfStatement); Advance();
                 destination.push_back(std::move(statement)); return;
             }
             if (currentToken.value == "break" || currentToken.value == "continue") {
                 auto control = std::make_unique<LoopControl>();
+                control->offset = currentToken.offset;
                 control->isBreak = currentToken.value == "break";
                 Advance(); Expect(TokenType::EndOfStatement); Advance();
                 destination.push_back(std::move(control)); return;
             }
             if (currentToken.value == "if") {
                 auto statement = std::make_unique<IfStatement>();
+                statement->offset = currentToken.offset;
                 Advance(); Expect(TokenType::LeftParen); Advance();
                 statement->condition = ParseExpression();
                 Expect(TokenType::RightParen); Advance();
@@ -637,13 +759,16 @@ int main(int argc, char** argv) {
             }
             if (currentToken.value == "while" || currentToken.value == "for" || currentToken.value == "do") {
                 auto loop = std::make_unique<LoopStatement>();
+                loop->offset = currentToken.offset;
                 const string kind = currentToken.value;
                 loop->kind = kind == "for" ? LoopStatement::Kind::For : kind == "do" ? LoopStatement::Kind::DoWhile : LoopStatement::Kind::While;
                 Advance();
                 if (kind != "do") {
                     Expect(TokenType::LeftParen); Advance();
                     if (kind == "for") {
-                        if (currentToken.type == TokenType::TypeName || currentToken.value == "const") {
+                        Lexer initLookahead = lexer;
+                        bool typeDeclaration = currentToken.type == TokenType::TypeName && initLookahead.NextToken().type != TokenType::LeftParen;
+                        if (typeDeclaration || currentToken.value == "const") {
                             vector<unique_ptr<ASTNode>> init;
                             ParseVariableDeclaration(init);
                             loop->initializer = std::move(init.front());
@@ -674,10 +799,62 @@ int main(int argc, char** argv) {
             destination.push_back(std::move(expression));
         }
 
+        vector<FunctionDeclaration::Parameter> ParseParameters(bool mustBeEmpty = false) {
+            vector<FunctionDeclaration::Parameter> parameters;
+            if (mustBeEmpty && currentToken.type != TokenType::RightParen)
+                throw std::runtime_error("Destructor cannot have parameters");
+            if (currentToken.type != TokenType::RightParen) {
+                do {
+                    FunctionDeclaration::Parameter parameter;
+                    parameter.offset = currentToken.offset;
+                    if (currentToken.type == TokenType::Identifier) throw std::runtime_error("Unknown type: " + currentToken.value);
+                    Expect(TokenType::TypeName); parameter.type = currentToken.value; Advance();
+                    while (currentToken.type == TokenType::Operator && currentToken.value == "*") { parameter.type += "*"; Advance(); }
+                    if (currentToken.value == "mutable") { parameter.isMutable = true; Advance(); }
+                    if (currentToken.type == TokenType::Operator && currentToken.value == "&&") {
+                        parameter.isConsumable = true;
+                        Advance();
+                    } else if (currentToken.type == TokenType::Operator && currentToken.value == "&") {
+                        parameter.isReference = true;
+                        parameter.isMutableReference = parameter.isMutable;
+                        Advance();
+                        if (currentToken.type == TokenType::At) {
+                            Advance(); Expect(TokenType::Identifier); parameter.lifetime = currentToken.value; Advance();
+                        }
+                    }
+                    Expect(TokenType::Identifier); parameter.name = currentToken.value; Advance();
+                    parameters.push_back(std::move(parameter));
+                    if (currentToken.type != TokenType::Comma) break;
+                    Advance();
+                } while (true);
+            }
+            Expect(TokenType::RightParen); Advance();
+            return parameters;
+        }
+
         void ParseFunctionStatement(vector<unique_ptr<ASTNode>>& destination) {
             Expect(TokenType::TypeName);
+            const size_t declarationOffset = currentToken.offset;
             string typev = currentToken.value;
             Advance();
+            while (currentToken.type == TokenType::Operator && currentToken.value == "*") { typev += "*"; Advance(); }
+
+            FunctionDeclaration function;
+            function.offset = declarationOffset;
+            function.returnType = typev;
+            if (currentToken.value == "mutable") { function.returnsMutableReference = true; Advance(); }
+            if (currentToken.type == TokenType::Operator && currentToken.value == "&&") {
+                function.returnsConsumable = true;
+                Advance();
+            } else if (currentToken.type == TokenType::Operator && currentToken.value == "&") {
+                function.returnsReference = true;
+                Advance();
+                if (currentToken.type == TokenType::At) {
+                    Advance(); Expect(TokenType::Identifier); function.returnLifetime = currentToken.value; Advance();
+                }
+            } else if (function.returnsMutableReference) {
+                throw std::runtime_error("mutable return requires a reference type");
+            }
 
             Expect(TokenType::Identifier);
             string ident = currentToken.value;
@@ -686,22 +863,9 @@ int main(int argc, char** argv) {
             Expect(TokenType::LeftParen);
             Advance();
 
-            FunctionDeclaration function;
             function.name = ident;
-            function.returnType = typev;
 
-            if (currentToken.type != TokenType::RightParen) {
-                do {
-                    FunctionDeclaration::Parameter parameter;
-                    Expect(TokenType::TypeName); parameter.type = currentToken.value; Advance();
-                    if (currentToken.value == "mutable") { parameter.isMutable = true; Advance(); }
-                    Expect(TokenType::Identifier); parameter.name = currentToken.value; Advance();
-                    function.parameters.push_back(std::move(parameter));
-                    if (currentToken.type != TokenType::Comma) break;
-                    Advance();
-                } while (true);
-            }
-            Expect(TokenType::RightParen); Advance();
+            function.parameters = ParseParameters();
 
             function.body = std::move(ParseBlock()->statements);
 
@@ -720,9 +884,11 @@ int main(int argc, char** argv) {
                 Advance();
             }
 
+            if (currentToken.type == TokenType::Identifier) throw std::runtime_error("Unknown type: " + currentToken.value);
             Expect(TokenType::TypeName);
             variable.type = currentToken.value;
             Advance();
+            while (currentToken.type == TokenType::Operator && currentToken.value == "*") { variable.type += "*"; Advance(); }
 
             if (currentToken.type == TokenType::Reserved &&
                 currentToken.value == "mutable") {
@@ -731,6 +897,15 @@ int main(int argc, char** argv) {
                 }
 
                 variable.isMutable = true;
+                Advance();
+            }
+
+            if (currentToken.type == TokenType::Operator && currentToken.value == "&&") {
+                variable.isConsumable = true;
+                Advance();
+            } else if (currentToken.type == TokenType::Operator && currentToken.value == "&") {
+                variable.isReference = true;
+                variable.isMutableReference = variable.isMutable;
                 Advance();
             }
 
@@ -754,14 +929,30 @@ int main(int argc, char** argv) {
             );
         }
 
+        unique_ptr<FunctionDeclaration> ParseSpecialMember(const string& typeName, bool destructor) {
+            const size_t offset = currentToken.offset;
+            if (destructor) Advance();
+            if (currentToken.value != typeName || currentToken.type != TokenType::TypeName)
+                throw std::runtime_error("Special member name must match the enclosing type");
+            Advance(); Expect(TokenType::LeftParen); Advance();
+            unique_ptr<FunctionDeclaration> declaration = destructor
+                ? unique_ptr<FunctionDeclaration>(std::make_unique<DestructorDeclaration>())
+                : unique_ptr<FunctionDeclaration>(std::make_unique<ConstructorDeclaration>());
+            declaration->offset = offset;
+            declaration->name = typeName;
+            declaration->returnType = "void";
+            declaration->parameters = ParseParameters(destructor);
+            declaration->body = std::move(ParseBlock()->statements);
+            return declaration;
+        }
+
         void ParseTypeDeclaration() {
             auto type = std::make_unique<TypeDeclaration>();
             type->isStruct = currentToken.value == "struct";
             type->offset = currentToken.offset;
-            Advance(); Expect(TokenType::Identifier);
+            Advance();
+            if (currentToken.type != TokenType::Identifier && currentToken.type != TokenType::TypeName) throw std::runtime_error("Expected type name");
             type->name = currentToken.value;
-            if (StandardType.contains(type->name)) throw std::runtime_error("Duplicate type: " + type->name);
-            StandardType[type->name] = true;
             Advance(); Expect(TokenType::LeftBrace); Advance();
             bool access = type->isStruct;
             while (currentToken.type != TokenType::RightBrace) {
@@ -773,9 +964,24 @@ int main(int argc, char** argv) {
                     if (currentToken.type == TokenType::Colon) { access = memberAccess; Advance(); continue; }
                 }
                 vector<unique_ptr<ASTNode>> member;
+                if (currentToken.type == TokenType::Operator && currentToken.value == "~") {
+                    member.push_back(ParseSpecialMember(type->name, true));
+                    type->members.push_back({memberAccess, std::move(member.front())});
+                    continue;
+                }
                 Lexer lookahead = lexer;
                 Token name = lookahead.NextToken();
+                if (currentToken.type == TokenType::TypeName && currentToken.value == type->name && name.type == TokenType::LeftParen) {
+                    member.push_back(ParseSpecialMember(type->name, false));
+                    type->members.push_back({memberAccess, std::move(member.front())});
+                    continue;
+                }
+                while (name.type == TokenType::Operator && name.value == "*") name = lookahead.NextToken();
                 if (name.value == "mutable") name = lookahead.NextToken();
+                if (name.type == TokenType::Operator && name.value == "&") {
+                    name = lookahead.NextToken();
+                    if (name.type == TokenType::At) { name = lookahead.NextToken(); name = lookahead.NextToken(); }
+                }
                 if (currentToken.type == TokenType::TypeName && name.type == TokenType::Identifier && lookahead.NextToken().type == TokenType::LeftParen)
                     ParseFunctionStatement(member);
                 else ParseVariableDeclaration(member, true);
@@ -803,7 +1009,13 @@ int main(int argc, char** argv) {
                 else if (currentToken.type == TokenType::TypeName) {
                     Lexer lookahead = lexer;
                     Token next = lookahead.NextToken();
+                    while (next.type == TokenType::Operator && next.value == "*") next = lookahead.NextToken();
                     if (next.value == "mutable") next = lookahead.NextToken();
+                    if (next.type == TokenType::Operator && next.value == "&&") next = lookahead.NextToken();
+                    if (next.type == TokenType::Operator && next.value == "&") {
+                        next = lookahead.NextToken();
+                        if (next.type == TokenType::At) { next = lookahead.NextToken(); next = lookahead.NextToken(); }
+                    }
                     if (next.type != TokenType::Identifier) throw std::runtime_error("Expected identifier");
                     if (lookahead.NextToken().type == TokenType::LeftParen) ParseFunctionStatement(program.children);
                     else ParseVariableDeclaration(program.children);
@@ -846,23 +1058,36 @@ int main(int argc, char** argv) {
                     parameters.clear();
                 } else if (tokens[i].type == TokenType::TypeName && i + 1 < tokens.size()) {
                     size_t j = i + 1;
+                    string pointerSuffix;
+                    while (j < tokens.size() && tokens[j].type == TokenType::Operator && tokens[j].value == "*") { pointerSuffix += "*"; ++j; }
                     bool isMutable = tokens[j].value == "mutable";
                     if (isMutable) ++j;
+                    bool isReference = j < tokens.size() && tokens[j].type == TokenType::Operator && tokens[j].value == "&";
+                    if (isReference) {
+                        ++j;
+                        if (j < tokens.size() && tokens[j].type == TokenType::At) j += 2;
+                    }
                     if (j >= tokens.size() || tokens[j].type != TokenType::Identifier) continue;
-                    string type = tokens[i].value, name = tokens[j].value;
+                    string type = tokens[i].value + pointerSuffix, name = tokens[j].value;
                     if (j + 1 < tokens.size() && tokens[j + 1].type == TokenType::LeftParen) {
-                        string detail = type + " " + name + "(";
+                        string detail = type + (isMutable ? " mutable" : "") + (isReference ? "&" : "") + " " + name + "(";
                         vector<Symbol> args;
                         size_t k = j + 2;
                         while (k < tokens.size() && tokens[k].type != TokenType::RightParen) {
                             if (tokens[k].type != TokenType::TypeName || k + 1 >= tokens.size()) break;
                             string argType = tokens[k++].value;
+                            while (k < tokens.size() && tokens[k].type == TokenType::Operator && tokens[k].value == "*") { argType += "*"; ++k; }
                             bool argMutable = tokens[k].value == "mutable";
                             if (argMutable) ++k;
+                            bool argReference = k < tokens.size() && tokens[k].type == TokenType::Operator && tokens[k].value == "&";
+                            if (argReference) {
+                                ++k;
+                                if (k < tokens.size() && tokens[k].type == TokenType::At) k += 2;
+                            }
                             if (k >= tokens.size() || tokens[k].type != TokenType::Identifier) break;
                             if (!args.empty()) detail += ", ";
-                            detail += argType + (argMutable ? " mutable " : " ") + tokens[k].value;
-                            args.push_back({"variable", tokens[k].value, argType + (argMutable ? " mutable" : "")});
+                            detail += argType + (argMutable ? " mutable" : "") + (argReference ? "&" : "") + " " + tokens[k].value;
+                            args.push_back({"variable", tokens[k].value, argType + (argMutable ? " mutable" : "") + (argReference ? "&" : "")});
                             ++k;
                             if (k < tokens.size() && tokens[k].type == TokenType::Comma) ++k;
                             else break;
@@ -871,7 +1096,7 @@ int main(int argc, char** argv) {
                         scopes.back().push_back({"function", name, detail});
                         if (k < tokens.size() && tokens[k].type == TokenType::RightParen) { parameters = std::move(args); i = k; }
                     } else {
-                        scopes.back().push_back({"variable", name, type + (isMutable ? " mutable" : "")});
+                        scopes.back().push_back({"variable", name, type + (isMutable ? " mutable" : "") + (isReference ? "&" : "")});
                         i = j;
                     }
                 }
@@ -888,38 +1113,108 @@ int main(int argc, char** argv) {
             for (const auto* name : {"true", "false"}) std::cout << "C4R_SYMBOL\tkeyword\t" << name << "\tbool\n";
             return 0;
         }
+        std::unordered_map<string, string> typeLocations;
+        auto scanFile = [&](const string& text, const string& filename) {
+            Lexer scan(text);
+            while (true) {
+                Token token = scan.NextToken();
+                if (token.type == TokenType::EndOfFile) break;
+                if (token.type == TokenType::Reserved && (token.value == "struct" || token.value == "class")) {
+                    Token name = scan.NextToken();
+                    if (name.type != TokenType::Identifier) {
+                        diagnosticOffset = name.offset;
+                        auto previous = typeLocations.find(name.value);
+                        throw std::runtime_error("Invalid or duplicate type name: " + name.value + " (" + filename +
+                            (previous == typeLocations.end() ? "" : ", previously " + previous->second) + ")");
+                    }
+                    typeLocations.emplace(name.value, filename);
+                    StandardType[name.value] = true;
+                }
+            }
+        };
+        if (check) scanFile(source, target);
+        else for (size_t i = 0; i < sourceFiles.size(); ++i) scanFile(sourceFiles[i], options.inputs[i]);
         if (check) {
             Lexer lexer(source);
             Parser parser(lexer);
             try { parser.ParseProgram(); }
             catch (...) { diagnosticOffset = parser.DiagnosticOffset(); throw; }
+            AssignSourceFile(parser.program, target);
+            Semantic semantic;
+            try { semantic.Collect(parser.program); semantic.CheckBodies(parser.program); }
+            catch (...) { diagnosticOffset = semantic.DiagnosticOffset(); throw; }
+            for (const auto* function : semantic.FunctionsWithMoves()) {
+                auto violations = OwnershipChecker(semantic).checkFunction(*function);
+                if (!violations.empty()) {
+                    diagnosticOffset = violations.front().offset;
+                    throw std::runtime_error(violations.front().action == OwnershipFlow::Action::Reinitialize
+                        ? "Copying a destructible value is not permitted: target is not definitely moved"
+                        : "Object may have already been moved or be uninitialized");
+                }
+            }
             LLVM llvm;
-            try { llvm.Generate(parser.program); }
+            try { llvm.Generate(parser.program, semantic); }
             catch (...) { diagnosticOffset = llvm.DiagnosticOffset(); throw; }
             return 0;
         }
         print("Compiling {}...\n", target);
-
         print("Parsing program...\n");
-        Lexer lexer(source);
-        Parser parser(lexer);
+        Program program;
+        for (size_t i = 0; i < sourceFiles.size(); ++i) {
+            const auto& text = sourceFiles[i];
+            Lexer lexer(text);
+            Parser parser(lexer);
+            try { parser.ParseProgram(); }
+            catch (const std::exception& e) { throw std::runtime_error(options.inputs[i] + ":" + std::to_string(parser.DiagnosticOffset()) + ": " + e.what()); }
+            AssignSourceFile(parser.program, options.inputs[i]);
+            for (auto& node : parser.program.children) {
+                program.children.push_back(std::move(node));
+            }
+        }
 
-        parser.ParseProgram();
-
+        Semantic semantic;
+        try { semantic.Collect(program, options.inputs.size() > 1); semantic.CheckBodies(program); }
+        catch (const std::exception& e) {
+            if (semantic.DiagnosticFile().empty()) throw;
+            throw std::runtime_error(semantic.DiagnosticFile() + ":" + std::to_string(semantic.DiagnosticOffset()) + ": " + e.what());
+        }
+        for (const auto* function : semantic.FunctionsWithMoves()) {
+            auto violations = OwnershipChecker(semantic).checkFunction(*function);
+            if (!violations.empty()) {
+                const auto& violation = violations.front();
+                const auto& filename = violation.site ? violation.site->sourceFile : function->sourceFile;
+                const char* message = violation.action == OwnershipFlow::Action::Reinitialize
+                    ? "Copying a destructible value is not permitted: target is not definitely moved"
+                    : "Object may have already been moved or be uninitialized";
+                throw std::runtime_error(filename + ":" + std::to_string(violation.offset) + ": " + message);
+            }
+        }
         print("Generating IR...\n");
         LLVM llvm;
-        llvm.Generate(parser.program);
+        llvm.Generate(program, semantic);
         llvm.Print();
 
         print("Generating Binary...\n");
-        auto objectPath = std::filesystem::path(target);
-        objectPath.replace_extension(".obj");
+        auto executablePath = options.output.empty() ?
+            (options.inputs.size() > 1 ? std::filesystem::path("app.exe") : std::filesystem::path(target).replace_extension(".exe")) :
+            std::filesystem::path(options.output);
 
-        auto executablePath = std::filesystem::path(target);
-        executablePath.replace_extension(".exe");
+        for (const auto& input : options.inputs) {
+            std::error_code error;
+            if (std::filesystem::exists(executablePath, error) && !error &&
+                std::filesystem::equivalent(executablePath, std::filesystem::path(input), error) && !error)
+                throw std::runtime_error("Output file is also an input file: " + input);
+        }
+        llvm::SmallString<128> temporaryPath;
+        auto error = llvm::sys::fs::createTemporaryFile("c4rc", "obj", temporaryPath);
+        if (error) throw std::system_error(error, "Failed to create temporary object file");
+        struct TemporaryObject {
+            std::filesystem::path path;
+            ~TemporaryObject() { std::error_code ignored; std::filesystem::remove(path, ignored); }
+        } object{std::filesystem::path(temporaryPath.c_str())};
 
-        llvm.WriteObject(objectPath);
-        llvm.LinkExecutable(objectPath, executablePath);
+        llvm.WriteObject(object.path);
+        llvm.LinkExecutable(object.path, executablePath);
 
         print("Generated {}\n", executablePath.string());
     }
@@ -930,7 +1225,7 @@ int main(int argc, char** argv) {
             std::cerr << "C4R_DIAGNOSTIC\t" << diagnosticOffset << "\t" << message << '\n';
             return 1;
         }
-        print("Compilation Error: {}\n", e.what());
+        std::cerr << "Compilation Error: " << e.what() << '\n';
         return -1;
     }
 

@@ -13,7 +13,7 @@
     "configuration": {
       "title": "C4R",
       "properties": {
-        "c4r.compilerPath": { "type": "string", "default": "", "description": "Path to the C4R compiler executable. Defaults to compiler/build/Debug/C4R.exe in the workspace." },
+        "c4r.compilerPath": { "type": "string", "default": "", "description": "Path to the C4R compiler executable. Defaults to compiler/build/Debug/c4rc.exe in the workspace." },
         "c4r.checkDelay": { "type": "number", "default": 500, "minimum": 100, "description": "Delay in milliseconds before checking changes." }
       }
     }

@@ -1,4 +1,4 @@
-param([string]$compiler = "$PSScriptRoot/../build/Debug/C4R.exe")
+param([string]$compiler = "$PSScriptRoot/../build/Debug/c4rc.exe")
 $ErrorActionPreference = 'Stop'
 $compiler = (Resolve-Path $compiler).Path
 $dir = Join-Path $PSScriptRoot '../build/control-tests'
@@ -6,15 +6,16 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 function Test-Program($name, $source, $expected) {
     $path = Join-Path $dir "$name.c4r"
     [IO.File]::WriteAllText($path, $source)
-    $compile = & $compiler $path 2>&1 | Out-String
+    $compile = & $compiler $path 2>&1 | Out-String -Width 10000
     if ($LASTEXITCODE -ne 0) { throw "$name compilation failed: $compile" }
     & ([IO.Path]::ChangeExtension($path, '.exe')) | Out-Null
     if ($LASTEXITCODE -ne $expected) { throw "$name exit $LASTEXITCODE, expected $expected" }
 }
 function Test-Rejected($name, $source, $message) {
+    $ErrorActionPreference = 'Continue'
     $path = Join-Path $dir "$name.c4r"
     [IO.File]::WriteAllText($path, $source)
-    $result = & $compiler $path 2>&1 | Out-String
+    $result = & $compiler $path 2>&1 | Out-String -Width 10000
     if ($LASTEXITCODE -eq 0 -or !$result.Contains($message)) { throw "$name should fail with $message`: $result" }
 }
 Test-Program if_return 'int32 main() { bool error = true; if (error) { return 7; } return 10; }' 7

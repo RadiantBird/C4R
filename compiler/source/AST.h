@@ -6,6 +6,7 @@
 
 struct ASTNode {
     size_t offset = 0;
+    std::string sourceFile;
     virtual ~ASTNode() = default;
 };
 
@@ -14,12 +15,28 @@ struct StringStatement : ASTNode {
 };
 
 struct FunctionDeclaration : ASTNode {
-    struct Parameter { std::string type, name; bool isMutable = false; };
+    struct Parameter {
+        std::string type, name;
+        bool isMutable = false;
+        bool isReference = false;
+        bool isMutableReference = false;
+        bool isConsumable = false;
+        std::string lifetime;
+        size_t offset = 0;
+        std::string sourceFile;
+    };
     std::string name;
     std::string returnType = "void";
+    bool returnsReference = false;
+    bool returnsMutableReference = false;
+    bool returnsConsumable = false;
+    std::string returnLifetime;
     std::vector<Parameter> parameters;
     std::vector<std::unique_ptr<ASTNode>> body;
 };
+
+struct ConstructorDeclaration : FunctionDeclaration {};
+struct DestructorDeclaration : FunctionDeclaration {};
 
 struct Program : ASTNode {
     std::vector<std::unique_ptr<ASTNode>> children;
@@ -53,6 +70,9 @@ struct VariableDeclaration : ASTNode {
     std::string type;
     bool isMutable = false;
     bool isConst = false;
+    bool isReference = false;
+    bool isMutableReference = false;
+    bool isConsumable = false;
     std::unique_ptr<Expression> initialValue;
     bool aggregateInit = false;
 };
@@ -80,6 +100,17 @@ struct CallExpr : Expression {
     std::string name;
     std::unique_ptr<Expression> object;
     std::vector<std::unique_ptr<Expression>> arguments;
+};
+
+struct ConstructExpr : Expression {
+    std::string type;
+    std::vector<std::unique_ptr<Expression>> arguments;
+};
+
+// An explicit ownership transfer; its operand remains an expression so later
+// semantic analysis can resolve the original binding and its source location.
+struct MoveExpr : Expression {
+    std::unique_ptr<Expression> operand;
 };
 
 struct CaptureDeclaration : ASTNode { std::vector<std::string> names; };

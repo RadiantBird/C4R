@@ -22,7 +22,7 @@ function activate(context) {
         for (const root of roots) {
             let dir = root;
             while (true) {
-                const candidate = path.join(dir, 'compiler', 'build', 'Debug', 'C4R.exe');
+                const candidate = path.join(dir, 'compiler', 'build', 'Debug', 'c4rc.exe');
                 if (fs.existsSync(candidate)) return candidate;
                 const parent = path.dirname(dir);
                 if (parent === dir) break;
@@ -52,7 +52,7 @@ function activate(context) {
             child.on('close', code => {
                 if (token.isCancellationRequested) return finish([]);
                 if (code !== 0) {
-                    output.appendLine(`Completion: compiler exited with code ${code}: ${stderr.trim()}. Check that C4R.exe is up to date.`);
+                    output.appendLine(`Completion: compiler exited with code ${code}: ${stderr.trim()}. Check that c4rc.exe is up to date.`);
                     return finish([]);
                 }
                 const symbols = stdout.split(/\r?\n/).map(line => line.split('\t'))

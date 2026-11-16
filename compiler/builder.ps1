@@ -1,6 +1,6 @@
 param(
     [string]$mode = "build",
-    [string]$exe  = "C4R",
+    [string]$exe  = "c4rc",
     [string]$source = "playground/var.c4r"
 )
 

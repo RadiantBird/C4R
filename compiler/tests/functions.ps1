@@ -1,4 +1,4 @@
-param([string]$compiler = "$PSScriptRoot/../build/Debug/C4R.exe")
+param([string]$compiler = "$PSScriptRoot/../build/Debug/c4rc.exe")
 $ErrorActionPreference = 'Stop'
 $compiler = (Resolve-Path $compiler).Path
 $dir = Join-Path $PSScriptRoot '../build/function-tests'
@@ -6,21 +6,23 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 function Test-Program($name, $source, $expectedExit, $expectedOutput = '') {
     $path = Join-Path $dir "$name.c4r"
     [IO.File]::WriteAllText($path, $source)
-    $compile = & $compiler $path 2>&1 | Out-String
+    $compile = & $compiler $path 2>&1 | Out-String -Width 10000
     if ($LASTEXITCODE -ne 0) { throw "$name compilation failed: $compile" }
-    $output = & ([IO.Path]::ChangeExtension($path, '.exe')) | Out-String
+    $output = & ([IO.Path]::ChangeExtension($path, '.exe')) | Out-String -Width 10000
     if ($LASTEXITCODE -ne $expectedExit) { throw "$name exit $LASTEXITCODE, expected $expectedExit" }
     if ($output.Trim().Replace("`r`n", "`n") -ne $expectedOutput.Replace("`r`n", "`n")) { throw "$name output '$output', expected '$expectedOutput'" }
 }
 function Test-Rejected($name, $source, $message) {
+    $ErrorActionPreference = 'Continue'
     $path = Join-Path $dir "$name.c4r"
     [IO.File]::WriteAllText($path, $source)
-    $result = & $compiler $path 2>&1 | Out-String
+    $result = & $compiler $path 2>&1 | Out-String -Width 10000
     if ($LASTEXITCODE -eq 0 -or !$result.Contains($message)) { throw "$name should fail with $message`: $result" }
 }
 Test-Program arguments 'int32 main() { return add(10, twice(5)); } int32 add(int32 a, int32 b) { return a + b; } int32 twice(int32 x) { return x * 2; }' 20
 Test-Program local 'int32 main() { int32 a() { int32 b() { return 42; } return b(); } return a(); }' 42
 Test-Program bare 'void hello() { "hello\n"; } hello; hello();' 0 "hello`nhello"
+Test-Program method_format 'class A { int value = 3; public: void show() { f"{value}\n"; } }; int32 main() { A a {}; a.show(); return 0; }' 0 '3'
 Test-Program capture 'int32 main() { int32 x = 10; int32 y = 20; int32 add() { capture x, y; return x + y; } return add(); }' 30
 Test-Program mutable_capture 'int32 main() { int32 mutable x = 10; void increment() { capture x; x++; } increment(); increment; return x; }' 12
 Test-Program capture_shadow 'int32 main() { int32 x = 7; int32 read() { capture x; return x; } { int32 x = 99; return read(); } }' 7

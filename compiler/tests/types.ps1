@@ -1,4 +1,4 @@
-param([string]$compiler = "$PSScriptRoot/../build/Debug/C4R.exe")
+param([string]$compiler = "$PSScriptRoot/../build/Debug/c4rc.exe")
 $ErrorActionPreference = 'Stop'
 $compiler = (Resolve-Path $compiler).Path
 $dir = Join-Path $PSScriptRoot '../build/type-tests'
@@ -6,15 +6,16 @@ New-Item -ItemType Directory -Force $dir | Out-Null
 function Test-Program($name, $source, $expected) {
     $path = Join-Path $dir "$name.c4r"
     [IO.File]::WriteAllText($path, $source)
-    $output = & $compiler $path 2>&1 | Out-String
+    $output = & $compiler $path 2>&1 | Out-String -Width 10000
     if ($LASTEXITCODE -ne 0) { throw "$name compilation failed: $output" }
     & ([IO.Path]::ChangeExtension($path, '.exe')) | Out-Null
     if ($LASTEXITCODE -ne $expected) { throw "$name returned $LASTEXITCODE, expected $expected" }
 }
 function Test-Rejected($name, $source, $message) {
+    $ErrorActionPreference = 'Continue'
     $path = Join-Path $dir "$name.c4r"
     [IO.File]::WriteAllText($path, $source)
-    $output = & $compiler $path 2>&1 | Out-String
+    $output = & $compiler $path 2>&1 | Out-String -Width 10000
     if ($LASTEXITCODE -eq 0 -or !$output.Contains($message)) { throw "$name should fail with $message`: $output" }
 }
 Test-Program independent 'struct Point { int mutable x = 4; int y; int get() { return x + y; } void inc() { x += 1; } }; int main() { Point mutable a {}; Point b {}; a.inc(); return a.get() + b.get(); }' 9
